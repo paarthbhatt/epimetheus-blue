@@ -1090,6 +1090,7 @@ impl CleanupEngine {
             | CleanupAction::File { path, fingerprint } => {
                 validate_fingerprint(path, fingerprint)?;
                 validate_no_mount_at_or_below(path, mounts)?;
+                validate_user_owned_tree(path)?;
             }
             CleanupAction::Trash { roots } => {
                 if path_has_symlink_component(path) {
@@ -1099,6 +1100,7 @@ impl CleanupEngine {
                     validate_fingerprint(root, fingerprint)?;
                     validate_no_mount_at_or_below(root, mounts)?;
                     validate_trash_entries(root, mounts)?;
+                    validate_user_owned_tree(root)?;
                 }
             }
             CleanupAction::ObservationOnly => {
@@ -1136,6 +1138,46 @@ impl CleanupEngine {
             .context("persisting cleanup receipt event")?;
         Ok(())
     }
+}
+
+/// Refuse mixed-ownership trees before the first deletion. Without this pass,
+/// Recursive deletion can reclaim user-owned children and then fail on a
+/// root-owned package-build directory, producing a misleading partial result.
+#[cfg(unix)]
+fn validate_user_owned_tree(path: &Path) -> Result<()> {
+    let own_uid = std::fs::metadata("/proc/self")?.uid();
+    let mut pending = vec![path.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(current) = pending.pop() {
+        seen = seen.saturating_add(1);
+        if seen > MAX_ENTRIES_PER_CANDIDATE {
+            bail!("ownership preflight exceeded its bounded entry limit");
+        }
+        let metadata = std::fs::symlink_metadata(&current)
+            .with_context(|| format!("reading ownership for {}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("ownership preflight encountered a symbolic link");
+        }
+        if metadata.uid() != own_uid {
+            bail!(
+                "candidate contains data owned by uid {}; refusing partial cleanup",
+                metadata.uid()
+            );
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&current).with_context(|| {
+                format!("reading {} during ownership preflight", current.display())
+            })? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_user_owned_tree(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[derive(Clone)]
