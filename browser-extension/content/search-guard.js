@@ -1,5 +1,5 @@
 /* Search-page protection. It removes only elements positively identified as
- * sponsored, strips known tracking parameters, and marks user-blocked domains. */
+ * sponsored, strips known tracking parameters, and marks blocked domains. */
 
 (() => {
   "use strict";
@@ -8,11 +8,18 @@
     "gclid", "dclid", "fbclid", "msclkid", "mc_cid", "mc_eid", "igshid",
     "vero_id", "wickedid", "yclid", "_hsenc", "_hsmi"
   ]);
+  const NATIVE_BATCH_SIZE = 200;
+  const nativeVerdicts = new Map();
+  const linksByDomain = new Map();
+  const pendingNativeDomains = new Set();
   let state = null;
   let removed = 0;
   let cleanedLinks = 0;
   let warnedLinks = 0;
   let scheduled = false;
+  let nativeCheckTimer = null;
+  let nativeCheckInFlight = false;
+  let nativeUnavailable = false;
 
   const selectors = {
     google: ["[data-text-ad]", "[data-ta-slot]", "div.uEierd"],
@@ -63,42 +70,162 @@
     return changed;
   }
 
+  function isVisible(link) {
+    if (!link.isConnected || link.closest(".blue-sponsored-hidden")) return false;
+    const style = getComputedStyle(link);
+    return style.display !== "none" && style.visibility !== "hidden" && link.getClientRects().length > 0;
+  }
+
+  function rememberLink(host, link) {
+    let links = linksByDomain.get(host);
+    if (!links) {
+      links = new Set();
+      linksByDomain.set(host, links);
+    }
+    links.add(link);
+  }
+
+  function blockDescription(host, list) {
+    return list
+      ? `${host} is blocked by the desktop filter list “${list}”`
+      : `${host} is on your local blocked-domain list`;
+  }
+
+  function markBlocked(link, host, list = null) {
+    if (link.dataset.blueBlocked === "true") return;
+    link.dataset.blueBlocked = "true";
+    link.dataset.blueBlockedDomain = host;
+    link.dataset.blueBlockedList = list || "";
+    link.classList.add("blue-blocked-link");
+
+    const badge = document.createElement("span");
+    badge.className = "blue-warning-badge";
+    badge.textContent = "BLUE BLOCKED";
+    badge.title = blockDescription(host, list);
+    link.insertAdjacentElement("afterend", badge);
+
+    if (link.dataset.blueWarningBound !== "true") {
+      link.dataset.blueWarningBound = "true";
+      link.addEventListener("click", (event) => {
+        if (link.dataset.blueBlocked !== "true") return;
+        event.preventDefault();
+        event.stopPropagation();
+        const blockedHost = link.dataset.blueBlockedDomain;
+        const blockedList = link.dataset.blueBlockedList;
+        const guidance = blockedList
+          ? `Desktop filter list: ${blockedList}\n\nManage desktop feeds to change this verdict.`
+          : "Remove it from your blocked list in the extension before continuing.";
+        alert(`Epimetheus Blue blocked this link:\n\n${blockedHost}\n\n${guidance}`);
+      }, true);
+    }
+    warnedLinks += 1;
+  }
+
+  function clearBlocked(link) {
+    if (link.dataset.blueBlocked !== "true") return;
+    link.classList.remove("blue-blocked-link");
+    delete link.dataset.blueBlocked;
+    delete link.dataset.blueBlockedDomain;
+    delete link.dataset.blueBlockedList;
+    if (link.nextElementSibling?.classList.contains("blue-warning-badge")) {
+      link.nextElementSibling.remove();
+    }
+    warnedLinks = Math.max(0, warnedLinks - 1);
+  }
+
+  function scheduleNativeCheck() {
+    if (nativeUnavailable || nativeCheckInFlight || nativeCheckTimer || pendingNativeDomains.size === 0) {
+      return;
+    }
+    // Give search pages one short turn to insert a whole result batch.
+    nativeCheckTimer = setTimeout(flushNativeChecks, 50);
+  }
+
+  async function flushNativeChecks() {
+    nativeCheckTimer = null;
+    if (nativeUnavailable || nativeCheckInFlight || pendingNativeDomains.size === 0) return;
+
+    const domains = [...pendingNativeDomains].slice(0, NATIVE_BATCH_SIZE);
+    for (const domain of domains) pendingNativeDomains.delete(domain);
+    nativeCheckInFlight = true;
+    try {
+      const response = await api.runtime.sendMessage({
+        type: "blue:check-domains",
+        domains
+      });
+      if (!response?.ok) {
+        if (response?.connected === false) nativeUnavailable = true;
+        return;
+      }
+
+      const results = response.domains || {};
+      for (const domain of domains) {
+        const verdict = results[domain] || { blocked: false };
+        nativeVerdicts.set(domain, verdict);
+        if (!verdict.blocked || domainMatches(domain, state.allowedDomains || [])) continue;
+        for (const link of linksByDomain.get(domain) || []) {
+          if (link.isConnected && state.warnBlocked) {
+            markBlocked(link, domain, verdict.list || "desktop feed");
+          }
+        }
+      }
+    } catch (_) {
+      // A missing host is expected when the desktop app is not installed.
+      nativeUnavailable = true;
+    } finally {
+      nativeCheckInFlight = false;
+      if (!nativeUnavailable && pendingNativeDomains.size > 0) scheduleNativeCheck();
+    }
+  }
+
+  function queueNativeCheck(host, link) {
+    if (nativeUnavailable || link.dataset.blueNativeChecked === "true") return;
+    link.dataset.blueNativeChecked = "true";
+    rememberLink(host, link);
+
+    if (nativeVerdicts.has(host)) {
+      const verdict = nativeVerdicts.get(host);
+      if (verdict.blocked) markBlocked(link, host, verdict.list || "desktop feed");
+      return;
+    }
+
+    pendingNativeDomains.add(host);
+    scheduleNativeCheck();
+  }
+
   function inspectLinks() {
-    const blocked = (state.blockedDomains || []).map((x) => String(x).toLowerCase());
-    const allowed = (state.allowedDomains || []).map((x) => String(x).toLowerCase());
+    const blocked = (state.blockedDomains || []).map((item) => String(item).toLowerCase());
+    const allowed = (state.allowedDomains || []).map((item) => String(item).toLowerCase());
     for (const link of document.querySelectorAll("a[href^='http']")) {
-      if (link.dataset.blueChecked === "true") continue;
-      link.dataset.blueChecked = "true";
       let url;
       try {
         url = new URL(link.href);
       } catch (_) {
         continue;
       }
-      const host = url.hostname.toLowerCase().replace(/^www\./, "");
-      if (state.stripTracking && stripTracking(url)) {
-        link.href = url.toString();
-        cleanedLinks += 1;
+      // Preserve the full hostname for the desktop matcher. In particular,
+      // stripping "www" would break exact DNS suffix attribution for a list
+      // that contains only www.example.test.
+      const host = url.hostname.toLowerCase().replace(/\.$/, "");
+
+      if (link.dataset.blueChecked !== "true") {
+        link.dataset.blueChecked = "true";
+        if (state.stripTracking && stripTracking(url)) {
+          link.href = url.toString();
+          cleanedLinks += 1;
+        }
       }
-      if (
-        state.warnBlocked &&
-        domainMatches(host, blocked) &&
-        !domainMatches(host, allowed)
-      ) {
-        link.classList.add("blue-blocked-link");
-        link.dataset.blueBlockedDomain = host;
-        const badge = document.createElement("span");
-        badge.className = "blue-warning-badge";
-        badge.textContent = "BLUE BLOCKED";
-        badge.title = `${host} is on your local blocked-domain list`;
-        link.insertAdjacentElement("afterend", badge);
-        link.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          alert(`Epimetheus Blue blocked this link:\n\n${host}\n\nRemove it from your blocked list in the extension before continuing.`);
-        }, true);
-        warnedLinks += 1;
+
+      if (!state.warnBlocked || domainMatches(host, allowed)) {
+        link.dataset.blueNativeChecked = "true";
+        continue;
       }
+      if (domainMatches(host, blocked)) {
+        link.dataset.blueNativeChecked = "true";
+        markBlocked(link, host);
+        continue;
+      }
+      if (isVisible(link)) queueNativeCheck(host, link);
     }
   }
 
@@ -125,6 +252,10 @@
     if (area !== "local") return;
     api.storage.local.get(null).then((next) => {
       state = next;
+      for (const link of document.querySelectorAll("a[data-blue-checked]")) {
+        clearBlocked(link);
+        delete link.dataset.blueNativeChecked;
+      }
       schedule();
     });
   });

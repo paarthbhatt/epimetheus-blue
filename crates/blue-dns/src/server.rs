@@ -1,27 +1,34 @@
-//! UDP sinkhole and forwarding resolver.
+//! UDP sinkhole and forwarding resolver with UDP and DNS-over-TLS upstreams.
 //!
 //! Each datagram is parsed just far enough to read the first question. Blocked
 //! names are answered locally (`NXDOMAIN`, or an A/AAAA zero answer); everything
-//! else is forwarded verbatim to an upstream over plaintext UDP and the raw
-//! reply is relayed back. There is no cache and no per-client policy yet.
+//! else is forwarded verbatim to a round-robin upstream and the raw reply is
+//! relayed back. There is no cache and no per-client policy yet.
 //!
-//! **Plaintext UDP is deliberate for this phase.** The next phase adds a DoT
-//! upstream client ([`forward`] is the seam: it takes the raw query and returns
-//! the raw response) and a `tls://` variant of [`DnsConfig::upstreams`].
+//! DNS-over-TLS follows RFC 7858 framing and authenticates the configured DNS
+//! name against the WebPKI root set. Each DoT request currently opens a fresh
+//! TCP/TLS connection. Keeping connection management inside [`forward_tls`] is
+//! an intentional performance seam for a future pooled/persistent transport.
 //!
 //! Malformed input never panics: it is counted in [`DnsStats::errors`] and
 //! dropped.
 
 use crate::blocklist::Blocklist;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 
 /// How long to wait for an upstream reply.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
@@ -40,10 +47,82 @@ const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 
+/// A recursive DNS server used for unblocked queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsUpstream {
+    /// Plaintext DNS over UDP.
+    Udp(SocketAddr),
+    /// DNS over TLS, with `server_name` used for SNI and certificate validation.
+    Tls {
+        addr: SocketAddr,
+        server_name: String,
+    },
+}
+
+impl DnsUpstream {
+    /// Parse `IP:PORT` as UDP or `tls://IP:PORT#dns-name` as DNS-over-TLS.
+    pub fn parse(value: &str) -> Result<Self> {
+        if let Some(value) = value.strip_prefix("tls://") {
+            let (addr, server_name) = value
+                .split_once('#')
+                .context("TLS DNS upstream must be tls://IP:PORT#dns-name")?;
+            if server_name.is_empty() {
+                bail!("TLS DNS upstream requires a nonempty DNS name");
+            }
+            if server_name.contains('#') {
+                bail!("TLS DNS upstream must contain exactly one '#' separator");
+            }
+
+            let addr = addr
+                .parse::<SocketAddr>()
+                .with_context(|| format!("invalid TLS DNS upstream socket {addr:?}"))?;
+            tls_server_name(server_name)?;
+            return Ok(Self::Tls {
+                addr,
+                server_name: server_name.to_owned(),
+            });
+        }
+
+        if let Some((scheme, _)) = value.split_once("://") {
+            bail!("unsupported DNS upstream scheme {scheme:?}");
+        }
+
+        value
+            .parse::<SocketAddr>()
+            .map(Self::Udp)
+            .with_context(|| format!("invalid UDP DNS upstream socket {value:?}"))
+    }
+}
+
+impl FromStr for DnsUpstream {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+}
+
+impl From<SocketAddr> for DnsUpstream {
+    fn from(addr: SocketAddr) -> Self {
+        Self::Udp(addr)
+    }
+}
+
+impl fmt::Display for DnsUpstream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Udp(addr) => addr.fmt(formatter),
+            Self::Tls { addr, server_name } => {
+                write!(formatter, "tls://{addr}#{server_name}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
     pub bind: SocketAddr,
-    pub upstreams: Vec<SocketAddr>,
+    pub upstreams: Vec<DnsUpstream>,
     pub block_response: BlockResponse,
 }
 
@@ -122,7 +201,7 @@ pub async fn run_with_stats(
 /// `:0` and learn the port.
 async fn serve(
     socket: Arc<UdpSocket>,
-    upstreams: Vec<SocketAddr>,
+    upstreams: Vec<DnsUpstream>,
     block_response: BlockResponse,
     blocklist: Arc<Blocklist>,
     stats: Arc<DnsStats>,
@@ -192,14 +271,14 @@ async fn serve(
         // Round-robin one upstream per query. A forwarder hop is allowed to take
         // up to the timeout, so it must not stall the receive loop.
         let index = round_robin.fetch_add(1, Ordering::Relaxed) % upstreams.len();
-        let upstream = upstreams[index];
+        let upstream = upstreams[index].clone();
         let raw = buf[..len].to_vec();
         let (id, flags, question) = (query.id, query.flags, query.question);
         let socket = Arc::clone(&socket);
         let stats = Arc::clone(&stats);
         let qname = query.qname;
         tokio::spawn(async move {
-            match forward(&raw, upstream).await {
+            match forward(&raw, &upstream).await {
                 Ok(response) => {
                     if let Err(err) = socket.send_to(&response, peer).await {
                         stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -221,10 +300,27 @@ async fn serve(
 }
 
 /// Send one raw query to one upstream and return its raw reply.
-///
-/// This is the seam for DoT: the caller does not care whether the bytes travelled
-/// over UDP or a TLS stream.
-async fn forward(query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
+async fn forward(query: &[u8], upstream: &DnsUpstream) -> Result<Vec<u8>> {
+    let query_id = query
+        .get(..2)
+        .context("cannot forward a DNS query without a two-byte ID")?;
+
+    let response = match upstream {
+        DnsUpstream::Udp(addr) => forward_udp(query, *addr).await?,
+        DnsUpstream::Tls { addr, server_name } => forward_tls(query, *addr, server_name).await?,
+    };
+
+    if response.len() < 12 {
+        bail!("upstream {upstream} returned a truncated header");
+    }
+    if &response[..2] != query_id {
+        bail!("upstream {upstream} returned a mismatched query id");
+    }
+    Ok(response)
+}
+
+/// Preserve the original UDP forwarding behavior, including its receive timeout.
+async fn forward_udp(query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
     let local: SocketAddr = if upstream.is_ipv4() {
         "0.0.0.0:0"
             .parse()
@@ -252,14 +348,82 @@ async fn forward(query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
         .with_context(|| format!("upstream {upstream} timed out"))?
         .with_context(|| format!("reading reply from {upstream}"))?;
     buf.truncate(len);
-
-    if buf.len() < 12 {
-        anyhow::bail!("upstream {upstream} returned a truncated header");
-    }
-    if buf[0..2] != query[0..2] {
-        anyhow::bail!("upstream {upstream} returned a mismatched query id");
-    }
     Ok(buf)
+}
+
+/// Perform one complete DoT exchange under a single overall timeout.
+async fn forward_tls(query: &[u8], addr: SocketAddr, server_name: &str) -> Result<Vec<u8>> {
+    timeout(
+        UPSTREAM_TIMEOUT,
+        forward_tls_inner(query, addr, server_name),
+    )
+    .await
+    .with_context(|| format!("upstream tls://{addr}#{server_name} timed out"))?
+}
+
+async fn forward_tls_inner(query: &[u8], addr: SocketAddr, server_name: &str) -> Result<Vec<u8>> {
+    let server_name = tls_server_name(server_name)?;
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Select the provider explicitly so workspace feature unification cannot
+    // make rustls' process-wide provider selection ambiguous.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("selecting safe TLS protocol versions")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let tcp = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting TCP to DoT upstream {addr}"))?;
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .with_context(|| format!("establishing authenticated TLS with DoT upstream {addr}"))?;
+
+    exchange_dot_frame(&mut tls, query)
+        .await
+        .with_context(|| format!("exchanging framed DNS message with DoT upstream {addr}"))
+}
+
+/// Write and read one RFC 7858 two-byte-length-prefixed DNS message.
+async fn exchange_dot_frame<S>(stream: &mut S, query: &[u8]) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let query_len = u16::try_from(query.len()).context("DoT query exceeds 65535 bytes")?;
+    stream
+        .write_all(&query_len.to_be_bytes())
+        .await
+        .context("writing DoT query length")?;
+    stream.write_all(query).await.context("writing DoT query")?;
+    stream.flush().await.context("flushing DoT query")?;
+
+    let mut length = [0u8; 2];
+    stream
+        .read_exact(&mut length)
+        .await
+        .context("reading DoT response length")?;
+    // The wire field is a u16, so this allocation is capped at 65,535 bytes.
+    let response_len = usize::from(u16::from_be_bytes(length));
+    let mut response = vec![0u8; response_len];
+    stream
+        .read_exact(&mut response)
+        .await
+        .with_context(|| format!("reading {response_len}-byte DoT response"))?;
+    Ok(response)
+}
+
+fn tls_server_name(server_name: &str) -> Result<ServerName<'static>> {
+    let parsed = ServerName::try_from(server_name.to_owned())
+        .map_err(|_| anyhow::anyhow!("invalid TLS DNS name {server_name:?}"))?;
+    if !matches!(&parsed, ServerName::DnsName(_)) {
+        bail!("TLS certificate name must be a DNS name, not an IP address");
+    }
+    Ok(parsed)
 }
 
 /// The pieces of a query we need to answer or attribute it.
@@ -391,6 +555,7 @@ fn build_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     fn query_bytes(id: u16, name: &str, qtype: u16) -> Vec<u8> {
         let mut q = Vec::new();
@@ -418,7 +583,7 @@ mod tests {
 
     async fn start(
         blocklist: Arc<Blocklist>,
-        upstreams: Vec<SocketAddr>,
+        upstreams: Vec<DnsUpstream>,
         mode: BlockResponse,
     ) -> (
         SocketAddr,
@@ -442,6 +607,97 @@ mod tests {
             .expect("timed out waiting for dns response")
             .unwrap();
         buf[..len].to_vec()
+    }
+
+    #[test]
+    fn upstream_parser_accepts_udp_and_tls() {
+        assert_eq!(
+            DnsUpstream::parse("9.9.9.9:53").unwrap(),
+            DnsUpstream::Udp("9.9.9.9:53".parse().unwrap())
+        );
+        assert_eq!(
+            DnsUpstream::parse("[2620:fe::fe]:53").unwrap(),
+            DnsUpstream::Udp("[2620:fe::fe]:53".parse().unwrap())
+        );
+        assert_eq!(
+            DnsUpstream::parse("tls://1.1.1.1:853#cloudflare-dns.com").unwrap(),
+            DnsUpstream::Tls {
+                addr: "1.1.1.1:853".parse().unwrap(),
+                server_name: "cloudflare-dns.com".to_owned(),
+            }
+        );
+        assert_eq!(
+            DnsUpstream::parse("tls://[2606:4700:4700::1111]:853#cloudflare-dns.com")
+                .unwrap()
+                .to_string(),
+            "tls://[2606:4700:4700::1111]:853#cloudflare-dns.com"
+        );
+    }
+
+    #[test]
+    fn upstream_parser_rejects_malformed_values_and_other_schemes() {
+        for value in [
+            "",
+            "dns.example:53",
+            "udp://9.9.9.9:53",
+            "https://9.9.9.9:443",
+            "TLS://1.1.1.1:853#cloudflare-dns.com",
+            "tls://1.1.1.1:853",
+            "tls://1.1.1.1:853#",
+            "tls://dns.example:853#dns.example",
+            "tls://1.1.1.1:853#not a dns name",
+            "tls://1.1.1.1:853#1.1.1.1",
+            "tls://1.1.1.1:853#dns.example#extra",
+        ] {
+            assert!(
+                DnsUpstream::parse(value).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dot_framing_uses_two_byte_lengths_and_reads_exact_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let query = query_bytes(0xA1B2, "example.org", TYPE_A);
+        let reply = query_with_qr(&query);
+        let expected_query = query.clone();
+        let expected_reply = reply.clone();
+
+        let helper = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).await.unwrap();
+            let length = usize::from(u16::from_be_bytes(length));
+            assert_eq!(length, expected_query.len());
+
+            let mut received = vec![0u8; length];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected_query);
+
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&(expected_reply.len() as u16).to_be_bytes());
+            framed.extend_from_slice(&expected_reply);
+            // A following frame must not become part of this response.
+            framed.extend_from_slice(&[0, 3, b'n', b'e', b'x']);
+            stream.write_all(&framed).await.unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let response = exchange_dot_frame(&mut stream, &query).await.unwrap();
+        assert_eq!(response, reply);
+        helper.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dot_framing_rejects_queries_larger_than_u16() {
+        let (mut stream, _peer) = tokio::io::duplex(1);
+        let oversized = vec![0u8; usize::from(u16::MAX) + 1];
+        let error = exchange_dot_frame(&mut stream, &oversized)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 65535"));
     }
 
     #[tokio::test]
@@ -523,7 +779,7 @@ mod tests {
 
         let (addr, stats, stop, handle) = start(
             test_blocklist("ads.example.com"),
-            vec![upstream_addr],
+            vec![upstream_addr.into()],
             BlockResponse::NxDomain,
         )
         .await;
@@ -544,6 +800,68 @@ mod tests {
         let _ = stop.send(true);
         assert!(timeout(Duration::from_secs(2), handle).await.is_ok());
         upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_round_robin_does_not_fallback_when_tls_fails() {
+        let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = tls_listener.local_addr().unwrap();
+        let tls_task = tokio::spawn(async move {
+            let (stream, _) = tls_listener.accept().await.unwrap();
+            // Dropping a plaintext connection makes the TLS handshake fail fast.
+            drop(stream);
+        });
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = udp.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..2], &[0x20, 0x02], "only the second query is UDP");
+            buf[2] |= 0x80;
+            udp.send_to(&buf[..len], peer).await.unwrap();
+        });
+
+        let upstreams = vec![
+            DnsUpstream::Tls {
+                addr: tls_addr,
+                server_name: "dns.example".to_owned(),
+            },
+            DnsUpstream::Udp(udp_addr),
+        ];
+        let (addr, stats, stop, handle) = start(
+            test_blocklist("ads.example.com"),
+            upstreams,
+            BlockResponse::NxDomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let failed = ask(
+            &client,
+            addr,
+            &query_bytes(0x2001, "first.example.org", TYPE_A),
+        )
+        .await;
+        assert_eq!(failed[3] & 0x0F, RCODE_SERVFAIL as u8);
+
+        let relayed = ask(
+            &client,
+            addr,
+            &query_bytes(0x2002, "second.example.org", TYPE_A),
+        )
+        .await;
+        assert_eq!(&relayed[..2], &[0x20, 0x02]);
+        assert_ne!(relayed[2] & 0x80, 0);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.total, 2);
+        assert_eq!(snap.errors, 1);
+
+        let _ = stop.send(true);
+        assert!(timeout(Duration::from_secs(2), handle).await.is_ok());
+        tls_task.await.unwrap();
+        udp_task.await.unwrap();
     }
 
     /// The fake upstream only flips QR; mirror that expectation.

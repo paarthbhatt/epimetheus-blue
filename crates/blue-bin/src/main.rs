@@ -36,6 +36,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Chromium native-messaging entrypoint (read-only, stdio protocol).
+    #[command(hide = true)]
+    NativeHost,
     /// Scan a file or directory once and print the verdicts.
     Scan(ScanArgs),
     /// Watch configured roots and scan files as they appear.
@@ -48,8 +51,14 @@ enum Cmd {
     Quarantine(QArgs),
     /// Run the integrity and persistence check once.
     Guard,
+    /// Observe current public egress destinations without changing the firewall.
+    Network,
     /// Filter feed maintenance.
     Feeds(FeedArgs),
+    /// Local and optional hash-only reputation checks.
+    Reputation(ReputationArgs),
+    /// Analyze and explicitly apply bounded storage cleanup candidates.
+    Cleanup(CleanupArgs),
     /// Prove the pipeline works end to end with the EICAR string.
     Drill,
     /// Check configuration, state, rules and detectors.
@@ -88,6 +97,57 @@ struct FeedArgs {
     cmd: FeedCmd,
 }
 
+#[derive(Args)]
+struct ReputationArgs {
+    #[command(subcommand)]
+    cmd: ReputationCmd,
+}
+
+#[derive(Subcommand)]
+enum ReputationCmd {
+    /// Download and validate configured local SHA-256 feeds.
+    Sync,
+    /// Show loaded local hash counts and online-provider state.
+    Status,
+    /// Check one file. Online queries are hash-only and require explicit --online.
+    Check {
+        path: PathBuf,
+        #[arg(long)]
+        online: bool,
+    },
+    /// Restore the previous version of a local hash feed.
+    Rollback { name: String },
+}
+
+#[derive(Args)]
+struct CleanupArgs {
+    #[command(subcommand)]
+    cmd: CleanupCmd,
+}
+
+#[derive(Subcommand)]
+enum CleanupCmd {
+    /// Analyze only. Nothing is selected or deleted.
+    Scan {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete only freshly revalidated candidate IDs after exact confirmation.
+    Apply {
+        #[arg(long = "id", required = true)]
+        ids: Vec<String>,
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Print the exact confirmation phrase for reviewed candidate IDs.
+    Phrase {
+        #[arg(long = "id", required = true)]
+        ids: Vec<String>,
+    },
+    /// Show memory pressure and the largest resident processes.
+    Performance,
+}
+
 #[derive(Subcommand)]
 enum FeedCmd {
     /// Download, validate and atomically activate configured filter lists.
@@ -105,10 +165,26 @@ struct Ctx {
 }
 
 fn main() {
-    if let Err(e) = run() {
+    let native_alias = std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|argument| Path::new(argument).file_name())
+        .is_some_and(|name| name == "blue-native-host");
+    let result = if native_alias {
+        run_native_alias()
+    } else {
+        run()
+    };
+    if let Err(e) = result {
         eprintln!("blue: {e:#}");
         std::process::exit(1);
     }
+}
+
+fn run_native_alias() -> Result<()> {
+    let config = Config::load(None)?;
+    let db = Arc::new(Db::open(&config.db_path())?);
+    blue_native_host::run(&config, db)
 }
 
 fn run() -> Result<()> {
@@ -118,12 +194,16 @@ fn run() -> Result<()> {
 
     match cli.cmd {
         None | Some(Cmd::App) => cmd_app(ctx),
+        Some(Cmd::NativeHost) => blue_native_host::run(&ctx.cfg, ctx.db.clone()),
         Some(Cmd::Scan(a)) => cmd_scan(&ctx, a),
         Some(Cmd::Watch) => cmd_watch(ctx),
         Some(Cmd::Dns) => cmd_dns(ctx),
         Some(Cmd::Quarantine(q)) => cmd_quarantine(&ctx, q),
         Some(Cmd::Guard) => cmd_guard(&ctx),
+        Some(Cmd::Network) => cmd_network(&ctx),
         Some(Cmd::Feeds(args)) => cmd_feeds(&ctx, args),
+        Some(Cmd::Reputation(args)) => cmd_reputation(&ctx, args),
+        Some(Cmd::Cleanup(args)) => cmd_cleanup(&ctx, args),
         Some(Cmd::Drill) => cmd_drill(&ctx),
         Some(Cmd::Verify) => cmd_verify(&ctx),
     }
@@ -328,6 +408,39 @@ fn cmd_guard(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+fn cmd_network(ctx: &Ctx) -> Result<()> {
+    let observer =
+        blue_net::NetObserver::new(ctx.db.clone(), blue_net::NetConfig::from_config(&ctx.cfg));
+    let report = observer.run_once()?;
+    if report.baseline {
+        println!(
+            "network baseline established: {} public connection(s)",
+            report.observed
+        );
+    } else {
+        println!(
+            "network observation: {} public connection(s), {} new destination(s), {} finding(s){}",
+            report.observed,
+            report.new_remote,
+            report.findings,
+            if report.truncated { " (truncated)" } else { "" }
+        );
+    }
+    for connection in report.connections.iter().take(25) {
+        println!(
+            "{:<5} {:<20} -> {:<22} {}",
+            connection.protocol,
+            connection.process.as_deref().unwrap_or("unknown"),
+            connection.remote,
+            connection.state
+        );
+    }
+    if report.connections.len() > 25 {
+        println!("… and {} more", report.connections.len() - 25);
+    }
+    Ok(())
+}
+
 fn cmd_feeds(ctx: &Ctx, args: FeedArgs) -> Result<()> {
     let feeds = blue_feeds::Feeds::new(
         ctx.db.clone(),
@@ -370,6 +483,197 @@ fn cmd_feeds(ctx: &Ctx, args: FeedArgs) -> Result<()> {
         FeedCmd::Rollback { name } => {
             feeds.rollback(&name)?;
             println!("rolled {name} back to the previous version");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_reputation(ctx: &Ctx, args: ReputationArgs) -> Result<()> {
+    let engine = blue_reputation::ReputationEngine::new(
+        ctx.db.clone(),
+        blue_reputation::ReputationConfig::from_config(&ctx.cfg),
+    )?;
+    match args.cmd {
+        ReputationCmd::Sync => {
+            let report = engine.sync()?;
+            for name in &report.updated {
+                println!("updated {name}");
+            }
+            for (name, reason) in &report.failed {
+                eprintln!("failed {name}: {reason}");
+            }
+            println!(
+                "{} hash source(s) updated, {} failed, {} SHA-256 hashes",
+                report.updated.len(),
+                report.failed.len(),
+                report.total_hashes
+            );
+            if report.updated.is_empty() && !report.failed.is_empty() {
+                bail!("no reputation source updated successfully");
+            }
+        }
+        ReputationCmd::Status => {
+            let status = engine.status();
+            println!(
+                "local reputation: {} SHA-256 hashes from {} source(s)",
+                status.local_hashes, status.local_sources
+            );
+            println!(
+                "VirusTotal: {} (key env: {})",
+                if ctx.cfg.reputation.virustotal_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                ctx.cfg.reputation.virustotal_api_key_env
+            );
+        }
+        ReputationCmd::Check { path, online } => {
+            let result = engine.check_file(&path, online)?;
+            println!("sha256: {}", result.sha256);
+            println!(
+                "local: {}",
+                result.local_match.as_deref().unwrap_or("not listed")
+            );
+            if let Some(vt) = &result.virustotal {
+                println!(
+                    "VirusTotal: {} (malicious {}, suspicious {}, harmless {})",
+                    vt.verdict, vt.malicious, vt.suspicious, vt.harmless
+                );
+            } else if online && !ctx.cfg.reputation.virustotal_enabled {
+                println!("VirusTotal: disabled by configuration; no query sent");
+            }
+            println!(
+                "verdict signal: {}",
+                result
+                    .detector
+                    .as_ref()
+                    .and_then(|value| value.signature.as_deref())
+                    .unwrap_or("none")
+            );
+        }
+        ReputationCmd::Rollback { name } => {
+            engine.rollback(&name)?;
+            println!("rolled {name} back to the previous hash feed");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_cleanup(ctx: &Ctx, args: CleanupArgs) -> Result<()> {
+    let engine = blue_cleanup::CleanupEngine::new(
+        ctx.db.clone(),
+        blue_cleanup::CleanupConfig::from_config(&ctx.cfg),
+    );
+    match args.cmd {
+        CleanupCmd::Scan { json } => {
+            let report = engine.scan()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            println!(
+                "cleanup inventory: safe {}, review {}, protected {} item(s) (not sized){}",
+                human_bytes(report.safe_bytes),
+                human_bytes(report.review_bytes),
+                report
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.risk == blue_cleanup::CleanupRisk::Protected)
+                    .count(),
+                if report.truncated { " (truncated)" } else { "" }
+            );
+            for candidate in &report.candidates {
+                println!(
+                    "{:<9} {:>10}  {}{}",
+                    format!("{:?}", candidate.risk).to_lowercase(),
+                    if candidate.risk == blue_cleanup::CleanupRisk::Protected
+                        && candidate.bytes == 0
+                    {
+                        "not sized".to_owned()
+                    } else {
+                        human_bytes(candidate.bytes)
+                    },
+                    candidate.label,
+                    if candidate.supported {
+                        ""
+                    } else {
+                        " [list-only]"
+                    }
+                );
+                println!("           id={} · {}", candidate.id, candidate.reason);
+                if let Some(path) = &candidate.path {
+                    println!("           {}", path.display());
+                }
+            }
+            if !report.diagnostics.is_empty() {
+                println!("diagnostics:");
+                for diagnostic in &report.diagnostics {
+                    println!("  - {diagnostic}");
+                }
+            }
+            println!("Nothing selected. Use candidate IDs with `blue cleanup apply` after review.");
+        }
+        CleanupCmd::Apply { ids, confirm } => {
+            let report = engine.apply(&ids, &confirm)?;
+            for receipt in &report.receipts {
+                println!(
+                    "{}  {} ({}){}",
+                    if receipt.success { "removed" } else { "failed" },
+                    receipt.label,
+                    human_bytes(receipt.bytes_before),
+                    receipt
+                        .error
+                        .as_ref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                );
+            }
+            println!(
+                "estimated reclaimed: {}",
+                human_bytes(report.reclaimed_estimate)
+            );
+        }
+        CleanupCmd::Phrase { ids } => {
+            let report = engine.scan()?;
+            let mut selected = Vec::new();
+            for id in &ids {
+                let candidate = report
+                    .candidates
+                    .iter()
+                    .find(|candidate| &candidate.id == id)
+                    .with_context(|| format!("unknown or stale cleanup candidate ID: {id}"))?;
+                if !candidate.supported
+                    || candidate.requires_root
+                    || candidate.risk == blue_cleanup::CleanupRisk::Protected
+                {
+                    bail!("candidate {id} is list-only, protected, or requires root");
+                }
+                selected.push(candidate.clone());
+            }
+            println!(
+                "{}",
+                blue_cleanup::CleanupEngine::required_confirmation(&selected)
+            );
+        }
+        CleanupCmd::Performance => {
+            let snapshot = blue_cleanup::performance_snapshot()?;
+            println!(
+                "memory: {} available / {} total; swap: {} free / {} total; {} processes",
+                human_bytes(snapshot.memory_available_bytes),
+                human_bytes(snapshot.memory_total_bytes),
+                human_bytes(snapshot.swap_free_bytes),
+                human_bytes(snapshot.swap_total_bytes),
+                snapshot.process_count
+            );
+            for process in snapshot.top_memory {
+                println!(
+                    "{:>7}  {:>9}  {}",
+                    process.pid,
+                    human_bytes(process.rss_bytes),
+                    process.name
+                );
+            }
         }
     }
     Ok(())
@@ -457,6 +761,39 @@ fn cmd_verify(ctx: &Ctx) -> Result<()> {
         println!("dns lists : none at {}", lists.display());
     }
 
+    match blue_reputation::ReputationEngine::new(
+        ctx.db.clone(),
+        blue_reputation::ReputationConfig::from_config(&ctx.cfg),
+    ) {
+        Ok(engine) => {
+            let status = engine.status();
+            println!(
+                "hash IOCs : OK ({} hashes, {} sources)",
+                status.local_hashes, status.local_sources
+            );
+        }
+        Err(error) => {
+            println!("hash IOCs : DEGRADED ({error:#})");
+            ok = false;
+        }
+    }
+
+    println!(
+        "network   : {}",
+        if ctx.db.get_meta("net:remote-baseline")?.is_some() {
+            "baseline present"
+        } else {
+            "no baseline (run `blue network`)"
+        }
+    );
+
+    for upstream in &ctx.cfg.dns.upstreams {
+        if let Err(error) = upstream.parse::<blue_dns::DnsUpstream>() {
+            println!("dns config : FAIL ({upstream}: {error})");
+            ok = false;
+        }
+    }
+
     if ok {
         println!("verify OK");
         Ok(())
@@ -505,6 +842,21 @@ fn collect_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 fn short_hash(h: &str) -> &str {
     h.get(..12).unwrap_or(h)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn init_tracing(level: &str) {

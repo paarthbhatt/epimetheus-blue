@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use blue_core::{
     classify, now_ms, reason, sha256_file, Config, Db, DetectorResult, Quarantine, Tier,
 };
+use blue_reputation::{ReputationConfig, ReputationEngine};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,7 @@ pub struct ScanConfig {
     pub clamd_required: bool,
     pub yara_dirs: Vec<PathBuf>,
     pub yara_timeout_ms: u64,
+    pub reputation: ReputationConfig,
 }
 
 impl ScanConfig {
@@ -66,6 +68,7 @@ impl ScanConfig {
             clamd_required: c.scan.clamav.required,
             yara_dirs,
             yara_timeout_ms: c.scan.yara.timeout_ms,
+            reputation: ReputationConfig::from_config(c),
         }
     }
 }
@@ -80,6 +83,7 @@ impl Default for ScanConfig {
             clamd_required: false,
             yara_dirs: Vec::new(),
             yara_timeout_ms: 5000,
+            reputation: ReputationConfig::default(),
         }
     }
 }
@@ -103,6 +107,8 @@ pub struct ScanEngine {
     rules: Mutex<RuleSet>,
     exclude: GlobSet,
     degraded: Option<String>,
+    reputation: Option<ReputationEngine>,
+    reputation_online: bool,
 }
 
 impl ScanEngine {
@@ -114,19 +120,28 @@ impl ScanEngine {
         let exclude = build_excludes(&cfg.exclude_globs)?;
         let rules = RuleSet::compile(&cfg.yara_dirs).context("loading YARA rules")?;
 
-        let degraded = if cfg.clamd_socket.exists() {
-            None
-        } else if cfg.clamd_required {
-            anyhow::bail!(
-                "clamd socket {} is required but missing",
-                cfg.clamd_socket.display()
-            );
-        } else {
-            Some(format!(
+        let mut degraded_reasons = Vec::new();
+        if !cfg.clamd_socket.exists() {
+            if cfg.clamd_required {
+                anyhow::bail!(
+                    "clamd socket {} is required but missing",
+                    cfg.clamd_socket.display()
+                );
+            }
+            degraded_reasons.push(format!(
                 "clamd socket {} missing; scanning with YARA only",
                 cfg.clamd_socket.display()
-            ))
+            ));
+        }
+        let reputation_online = cfg.reputation.virustotal_query_on_scan;
+        let reputation = match ReputationEngine::new(db.clone(), cfg.reputation.clone()) {
+            Ok(engine) => Some(engine),
+            Err(error) => {
+                degraded_reasons.push(format!("local reputation unavailable: {error}"));
+                None
+            }
         };
+        let degraded = (!degraded_reasons.is_empty()).then(|| degraded_reasons.join("; "));
         if let Some(reason) = &degraded {
             tracing::warn!("scanner degraded: {reason}");
         }
@@ -138,6 +153,8 @@ impl ScanEngine {
             rules: Mutex::new(rules),
             exclude,
             degraded,
+            reputation,
+            reputation_online,
         })
     }
 
@@ -196,6 +213,20 @@ impl ScanEngine {
         let sha256 = sha256_file(path).with_context(|| format!("hashing {}", path.display()))?;
 
         let mut results = self.run_detectors(path);
+        if let Some(reputation) = &self.reputation {
+            match reputation.check_hash(&sha256, self.reputation_online) {
+                Ok(result) => {
+                    if let Some(detector) = result.detector {
+                        results.push(detector);
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "reputation check degraded"
+                ),
+            }
+        }
         results.sort_by(|a, b| {
             a.detector
                 .as_str()
@@ -343,6 +374,12 @@ mod tests {
         let db = Arc::new(Db::open_memory().unwrap());
         let quarantine =
             Arc::new(Quarantine::new(dir.path().join("quarantine"), db.clone()).unwrap());
+        let mut reputation = ReputationConfig {
+            local_dir: dir.path().join("hash-feeds"),
+            ..ReputationConfig::default()
+        };
+        reputation.sources.clear();
+        reputation.virustotal_enabled = false;
 
         let mut cfg = ScanConfig {
             roots: vec![dir.path().to_path_buf()],
@@ -352,6 +389,7 @@ mod tests {
             clamd_required: false,
             yara_dirs: vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules")],
             yara_timeout_ms: 5000,
+            reputation,
         };
         adjust(&mut cfg);
 
@@ -400,6 +438,28 @@ mod tests {
         assert!(outcome.artifact_id > 0);
         assert!(!outcome.sha256.is_empty());
         assert!(path.exists(), "a clean file must not move");
+    }
+
+    #[test]
+    fn exact_local_reputation_hash_is_corroborated() {
+        let bytes = b"known-malicious-hash-fixture";
+        let hash = blue_core::sha256_bytes(bytes);
+        let f = fixture(|cfg| {
+            std::fs::create_dir_all(&cfg.reputation.local_dir).unwrap();
+            std::fs::write(
+                cfg.reputation.local_dir.join("test.sha256"),
+                format!("{hash};unit test IOC\n"),
+            )
+            .unwrap();
+        });
+        let path = write(&f.dir, "known.bin", bytes);
+        let outcome = f.engine.scan_path(&path).unwrap();
+        assert_eq!(outcome.tier, Tier::Corroborated);
+        assert!(outcome
+            .results
+            .iter()
+            .any(|result| result.detector == blue_core::Detector::HashRep));
+        assert!(outcome.quarantined.is_some());
     }
 
     #[test]

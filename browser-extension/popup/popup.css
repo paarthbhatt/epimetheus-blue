@@ -23,6 +23,16 @@ label input:checked + i { background: #195b45; }
 label input:checked + i::after { left: 18px; background: #3ecf8e; }
 section { padding: 1px 11px; border: 1px solid #253348; border-radius: 10px; background: #0e1624; }
 section label + label { border-top: 1px solid #1d293a; }
+.desktop { margin-top: 12px; padding: 10px 11px; border: 1px solid #253348; border-radius: 10px; background: #0e1624; }
+.desktop-heading { display: flex; align-items: center; justify-content: space-between; color: #cbd5e3; font-size: 12px; }
+.desktop-heading b { color: #d9a441; }
+.desktop-heading b.connected { color: #3ecf8e; }
+.desktop-heading b.disconnected { color: #ff9ca4; }
+.desktop-heading button { padding: 4px 8px; border: 1px solid #35516c; border-radius: 6px; background: #14263a; color: #cbd5e3; font-size: 10px; cursor: pointer; }
+.desktop-heading button:disabled { cursor: wait; opacity: .55; }
+.native-counts { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 10px; margin-top: 9px; color: #8b99af; font-size: 9px; }
+.native-counts b { color: #58a6ff; font-size: 11px; }
+#desktop-detail { margin: 8px 0 0; overflow: hidden; color: #66758a; font: 9px/1.35 ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 12px 0; }
 .stats div { padding: 9px 4px; text-align: center; border: 1px solid #253348; border-radius: 8px; background: #0e1624; }
 .stats b { display: block; color: #58a6ff; font-size: 17px; }

@@ -2,6 +2,8 @@
  * No remote code, analytics, or network calls. Settings stay in the profile. */
 
 const api = globalThis.browser ?? globalThis.chrome;
+const NATIVE_HOST = "com.epimetheus.blue";
+let nativeSequence = 0;
 
 const DEFAULTS = Object.freeze({
   enabled: true,
@@ -21,6 +23,32 @@ const RESOURCE_TYPES = [
 
 async function settings() {
   return { ...DEFAULTS, ...(await api.storage.local.get(DEFAULTS)) };
+}
+
+/**
+ * Send one read-only request to the desktop app. Chromium starts the native
+ * host for sendNativeMessage, so callers are responsible for batching rather
+ * than issuing one request per link.
+ */
+async function nativeRequest(message) {
+  const id = message.id ?? `${Date.now()}-${++nativeSequence}`;
+  try {
+    const response = await api.runtime.sendNativeMessage(
+      NATIVE_HOST,
+      { ...message, id }
+    );
+    if (!response || typeof response !== "object") {
+      throw new Error("native host returned no response");
+    }
+    return response;
+  } catch (error) {
+    return {
+      id,
+      ok: false,
+      connected: false,
+      error: `Desktop app is not connected: ${error?.message || String(error)}`
+    };
+  }
 }
 
 function normalizedDomain(value) {
@@ -104,6 +132,20 @@ api.omnibox.onInputEntered.addListener(async (text) => {
 });
 
 api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "blue:native-status") {
+    nativeRequest({ type: "status" }).then(sendResponse);
+    return true;
+  }
+  if (message?.type === "blue:check-domains") {
+    if (!Array.isArray(message.domains)) {
+      sendResponse({ ok: false, error: "domains must be an array" });
+      return false;
+    }
+    const domains = [...new Set(message.domains.filter((domain) => typeof domain === "string"))]
+      .slice(0, 200);
+    nativeRequest({ type: "check_domains", domains }).then(sendResponse);
+    return true;
+  }
   if (message?.type === "blue:rebuild-rules") {
     rebuildDynamicRules()
       .then(() => sendResponse({ ok: true }))
@@ -124,5 +166,5 @@ api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 // Export pure helpers for the Node validation suite without affecting Chromium.
 if (typeof module !== "undefined") {
-  module.exports = { normalizedDomain, searchUrl };
+  module.exports = { nativeRequest, normalizedDomain, searchUrl };
 }

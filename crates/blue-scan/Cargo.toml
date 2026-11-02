@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 blue-core.workspace = true
+blue-reputation = { path = "../blue-reputation" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

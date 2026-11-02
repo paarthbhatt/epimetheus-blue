@@ -58,6 +58,9 @@ enum Page {
     Overview,
     Scanner,
     Integrity,
+    Network,
+    Reputation,
+    Cleanup,
     Quarantine,
     Filters,
     Browser,
@@ -97,6 +100,19 @@ impl Snapshot {
 enum JobResult {
     Scan(Result<ScanSummary, String>),
     Guard(Result<GuardReport, String>),
+    Network(Result<blue_net::NetReport, String>),
+    ReputationSync(Result<blue_reputation::HashSyncReport, String>),
+    ReputationCheck(Result<blue_reputation::ReputationResult, String>),
+    CleanupScan(
+        Result<
+            (
+                blue_cleanup::CleanupReport,
+                blue_cleanup::PerformanceSnapshot,
+            ),
+            String,
+        >,
+    ),
+    CleanupApply(Result<blue_cleanup::ApplyReport, String>),
     Feeds(Result<SyncReport, String>),
     Rollback(String, Result<(), String>),
     Restore(i64, Result<PathBuf, String>),
@@ -125,6 +141,15 @@ struct BlueApp {
     scan_path: String,
     last_scan: Option<ScanSummary>,
     last_guard: Option<GuardReport>,
+    last_net: Option<blue_net::NetReport>,
+    reputation_status: Option<blue_reputation::ReputationStatus>,
+    reputation_result: Option<blue_reputation::ReputationResult>,
+    reputation_path: String,
+    reputation_online: bool,
+    cleanup_report: Option<blue_cleanup::CleanupReport>,
+    cleanup_performance: Option<blue_cleanup::PerformanceSnapshot>,
+    cleanup_selected: HashSet<String>,
+    cleanup_confirmation: String,
     last_feed: Option<SyncReport>,
     realtime: bool,
     watcher_stop: Option<tokio::sync::watch::Sender<bool>>,
@@ -134,9 +159,14 @@ struct BlueApp {
     dns_routed: bool,
     guard_timer: bool,
     feed_timer: bool,
+    net_timer: bool,
+    reputation_timer: bool,
     watch_unit_installed: bool,
     guard_unit_installed: bool,
     feed_unit_installed: bool,
+    net_unit_installed: bool,
+    reputation_unit_installed: bool,
+    dns_unit_installed: bool,
     last_service_refresh: Instant,
 }
 
@@ -156,6 +186,11 @@ impl BlueApp {
         let watch_unit_installed = user_unit_exists("blue-watch.service");
         let guard_unit_installed = user_unit_exists("blue-guard.timer");
         let feed_unit_installed = user_unit_exists("blue-feeds.timer");
+        let net_unit_installed = user_unit_exists("blue-net.timer");
+        let reputation_unit_installed = user_unit_exists("blue-reputation.timer");
+        let dns_unit_installed = user_unit_exists("blue-dns.service");
+        let dns_routed = system_dns_uses_loopback();
+        let reputation_path = scan_path.clone();
         BlueApp {
             deps,
             page: Page::Overview,
@@ -169,18 +204,33 @@ impl BlueApp {
             scan_path,
             last_scan: None,
             last_guard: None,
+            last_net: None,
+            reputation_status: None,
+            reputation_result: None,
+            reputation_path,
+            reputation_online: false,
+            cleanup_report: None,
+            cleanup_performance: None,
+            cleanup_selected: HashSet::new(),
+            cleanup_confirmation: String::new(),
             last_feed: None,
             realtime: watch_unit_installed && user_unit_active("blue-watch.service"),
             watcher_stop: None,
-            dns: false,
+            dns: dns_unit_installed && dns_routed && user_unit_active("blue-dns.service"),
             dns_stop: None,
             dns_stats: Arc::new(blue_dns::DnsStats::default()),
-            dns_routed: system_dns_uses_loopback(),
+            dns_routed,
             guard_timer: guard_unit_installed && user_unit_active("blue-guard.timer"),
             feed_timer: feed_unit_installed && user_unit_active("blue-feeds.timer"),
+            net_timer: net_unit_installed && user_unit_active("blue-net.timer"),
+            reputation_timer: reputation_unit_installed
+                && user_unit_active("blue-reputation.timer"),
             watch_unit_installed,
             guard_unit_installed,
             feed_unit_installed,
+            net_unit_installed,
+            reputation_unit_installed,
+            dns_unit_installed,
             last_service_refresh: Instant::now(),
         }
     }
@@ -194,6 +244,7 @@ impl BlueApp {
             Err(error) => self.refresh_error = Some(error.to_string()),
         }
         if self.last_service_refresh.elapsed() > Duration::from_secs(15) {
+            self.dns_routed = system_dns_uses_loopback();
             if self.watch_unit_installed {
                 self.realtime = user_unit_active("blue-watch.service");
             }
@@ -202,6 +253,15 @@ impl BlueApp {
             }
             if self.feed_unit_installed {
                 self.feed_timer = user_unit_active("blue-feeds.timer");
+            }
+            if self.net_unit_installed {
+                self.net_timer = user_unit_active("blue-net.timer");
+            }
+            if self.reputation_unit_installed {
+                self.reputation_timer = user_unit_active("blue-reputation.timer");
+            }
+            if self.dns_unit_installed && self.dns_routed {
+                self.dns = user_unit_active("blue-dns.service");
             }
             self.last_service_refresh = Instant::now();
         }
@@ -244,6 +304,112 @@ impl BlueApp {
                             };
                             self.message = Some((text, report.findings == 0));
                             self.last_guard = Some(report);
+                        }
+                        Err(error) => self.message = Some((error, false)),
+                    }
+                }
+                JobResult::Network(result) => {
+                    self.jobs.remove("network");
+                    match result {
+                        Ok(report) => {
+                            self.message = Some((
+                                if report.baseline {
+                                    format!(
+                                        "Network baseline established: {} public destination(s)",
+                                        report.observed
+                                    )
+                                } else {
+                                    format!(
+                                        "Network observation: {} new destination(s)",
+                                        report.new_remote
+                                    )
+                                },
+                                report.findings == 0,
+                            ));
+                            self.last_net = Some(report);
+                        }
+                        Err(error) => self.message = Some((error, false)),
+                    }
+                }
+                JobResult::ReputationSync(result) => {
+                    self.jobs.remove("reputation-sync");
+                    match result {
+                        Ok(report) => {
+                            self.message = Some((
+                                format!(
+                                    "Hash feeds updated: {} source(s), {} SHA-256 hashes",
+                                    report.updated.len(),
+                                    report.total_hashes
+                                ),
+                                report.failed.is_empty(),
+                            ));
+                            self.refresh_reputation_status();
+                        }
+                        Err(error) => self.message = Some((error, false)),
+                    }
+                }
+                JobResult::ReputationCheck(result) => {
+                    self.jobs.remove("reputation-check");
+                    match result {
+                        Ok(result) => {
+                            let matched = result.detector.is_some();
+                            self.message = Some((
+                                if matched {
+                                    "Reputation signal found; review the source and counts below"
+                                        .into()
+                                } else {
+                                    "No configured reputation source listed this exact hash".into()
+                                },
+                                !matched,
+                            ));
+                            self.reputation_result = Some(result);
+                        }
+                        Err(error) => self.message = Some((error, false)),
+                    }
+                }
+                JobResult::CleanupScan(result) => {
+                    self.jobs.remove("cleanup-scan");
+                    match result {
+                        Ok((report, performance)) => {
+                            let candidate_ids = report
+                                .candidates
+                                .iter()
+                                .map(|candidate| candidate.id.clone())
+                                .collect::<HashSet<_>>();
+                            self.cleanup_selected
+                                .retain(|id| candidate_ids.contains(id));
+                            self.cleanup_report = Some(report);
+                            self.cleanup_performance = Some(performance);
+                            self.cleanup_confirmation.clear();
+                            self.message = Some((
+                                "Cleanup analysis complete. Nothing was selected or deleted."
+                                    .into(),
+                                true,
+                            ));
+                        }
+                        Err(error) => self.message = Some((error, false)),
+                    }
+                }
+                JobResult::CleanupApply(result) => {
+                    self.jobs.remove("cleanup-apply");
+                    match result {
+                        Ok(report) => {
+                            let succeeded = report
+                                .receipts
+                                .iter()
+                                .filter(|receipt| receipt.success)
+                                .count();
+                            let failed = report.receipts.len().saturating_sub(succeeded);
+                            self.message = Some((
+                                format!(
+                                    "Cleanup complete: {succeeded} removed, {failed} failed, {} estimated reclaimed",
+                                    format_bytes(report.reclaimed_estimate)
+                                ),
+                                failed == 0,
+                            ));
+                            self.cleanup_selected.clear();
+                            self.cleanup_confirmation.clear();
+                            self.run_cleanup_scan();
                         }
                         Err(error) => self.message = Some((error, false)),
                     }
@@ -316,6 +482,111 @@ impl BlueApp {
                 .run_once()
                 .map_err(|error| format!("Integrity check failed: {error:#}"));
             let _ = tx.send(JobResult::Guard(result));
+        });
+    }
+
+    fn run_network(&mut self) {
+        if !self.jobs.insert("network") {
+            return;
+        }
+        let observer = blue_net::NetObserver::new(
+            self.deps.db.clone(),
+            blue_net::NetConfig::from_config(&self.deps.config),
+        );
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = observer
+                .run_once()
+                .map_err(|error| format!("Network observation failed: {error:#}"));
+            let _ = tx.send(JobResult::Network(result));
+        });
+    }
+
+    fn reputation_engine(&self) -> Result<blue_reputation::ReputationEngine> {
+        blue_reputation::ReputationEngine::new(
+            self.deps.db.clone(),
+            blue_reputation::ReputationConfig::from_config(&self.deps.config),
+        )
+    }
+
+    fn refresh_reputation_status(&mut self) {
+        match self.reputation_engine() {
+            Ok(engine) => self.reputation_status = Some(engine.status()),
+            Err(error) => {
+                self.message = Some((format!("Reputation unavailable: {error:#}"), false))
+            }
+        }
+    }
+
+    fn sync_reputation(&mut self) {
+        if !self.jobs.insert("reputation-sync") {
+            return;
+        }
+        let db = self.deps.db.clone();
+        let config = blue_reputation::ReputationConfig::from_config(&self.deps.config);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = blue_reputation::ReputationEngine::new(db, config)
+                .and_then(|engine| engine.sync())
+                .map_err(|error| format!("Hash feed update failed: {error:#}"));
+            let _ = tx.send(JobResult::ReputationSync(result));
+        });
+    }
+
+    fn check_reputation(&mut self) {
+        if !self.jobs.insert("reputation-check") {
+            return;
+        }
+        let path = blue_core::config::expand_tilde(self.reputation_path.trim());
+        let online = self.reputation_online;
+        let db = self.deps.db.clone();
+        let config = blue_reputation::ReputationConfig::from_config(&self.deps.config);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = blue_reputation::ReputationEngine::new(db, config)
+                .and_then(|engine| engine.check_file(&path, online))
+                .map_err(|error| format!("Reputation check failed: {error:#}"));
+            let _ = tx.send(JobResult::ReputationCheck(result));
+        });
+    }
+
+    fn cleanup_engine(&self) -> blue_cleanup::CleanupEngine {
+        blue_cleanup::CleanupEngine::new(
+            self.deps.db.clone(),
+            blue_cleanup::CleanupConfig::from_config(&self.deps.config),
+        )
+    }
+
+    fn run_cleanup_scan(&mut self) {
+        if !self.jobs.insert("cleanup-scan") {
+            return;
+        }
+        let engine = self.cleanup_engine();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = engine
+                .scan()
+                .and_then(|report| {
+                    blue_cleanup::performance_snapshot().map(|performance| (report, performance))
+                })
+                .map_err(|error| format!("Cleanup analysis failed: {error:#}"));
+            let _ = tx.send(JobResult::CleanupScan(result));
+        });
+    }
+
+    fn apply_cleanup(&mut self) {
+        if !self.jobs.insert("cleanup-apply") {
+            return;
+        }
+        let ids = self.cleanup_selected.iter().cloned().collect::<Vec<_>>();
+        let confirmation = self.cleanup_confirmation.clone();
+        let engine = self.cleanup_engine();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = engine
+                .apply(&ids, &confirmation)
+                .map_err(|error| format!("Cleanup refused: {error:#}"));
+            let _ = tx.send(JobResult::CleanupApply(result));
         });
     }
 
@@ -418,6 +689,28 @@ impl BlueApp {
     }
 
     fn toggle_dns(&mut self, on: bool) {
+        if self.dns_routed && self.dns_unit_installed {
+            if !on {
+                self.dns = true;
+                self.message = Some((
+                    "System DNS is routed through Blue. Use setup-system-dns.sh disable so NetworkManager is restored before the resolver stops."
+                        .into(),
+                    false,
+                ));
+                return;
+            }
+            match set_user_unit("blue-dns.service", true) {
+                Ok(()) => {
+                    self.dns = true;
+                    self.message = Some(("System DNS shield started".into(), true));
+                }
+                Err(error) => {
+                    self.dns = false;
+                    self.message = Some((format!("DNS service failed: {error:#}"), false));
+                }
+            }
+            return;
+        }
         if !on {
             if let Some(stop) = self.dns_stop.take() {
                 let _ = stop.send(true);
@@ -534,6 +827,9 @@ impl BlueApp {
                     (Page::Overview, "◈", "Overview"),
                     (Page::Scanner, "⌕", "Scanner"),
                     (Page::Integrity, "⌁", "Integrity"),
+                    (Page::Network, "⇄", "Network"),
+                    (Page::Reputation, "#", "Reputation"),
+                    (Page::Cleanup, "◫", "Cleanup"),
                     (Page::Quarantine, "◇", "Quarantine"),
                     (Page::Filters, "≋", "Filters"),
                     (Page::Browser, "◎", "Browser Shield"),
@@ -635,6 +931,24 @@ impl BlueApp {
             "Security overview",
             "One honest view of what is protected and what needs attention.",
         );
+        let clamd_socket = blue_core::config::expand_tilde(&self.deps.config.scan.clamav.socket);
+        if !clamd_socket.exists() {
+            Frame::new()
+                .fill(Color32::from_rgb(54, 40, 17))
+                .stroke(Stroke::new(1.0, AMBER))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::symmetric(12, 9))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "DEGRADED · ClamAV is unavailable; YARA-X protection remains active",
+                        )
+                        .color(AMBER)
+                        .strong(),
+                    );
+                });
+            ui.add_space(12.0);
+        }
         ui.columns(4, |columns| {
             stat_card(
                 &mut columns[0],
@@ -853,6 +1167,454 @@ impl BlueApp {
         });
     }
 
+    fn network(&mut self, ui: &mut egui::Ui) {
+        self.header(
+            ui,
+            "Network observer",
+            "Read-only egress inventory. New does not mean malicious.",
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.jobs.contains("network"),
+                    egui::Button::new("Observe connections"),
+                )
+                .clicked()
+            {
+                self.run_network();
+            }
+            if self.jobs.contains("network") {
+                ui.spinner();
+            }
+            ui.label(
+                RichText::new("No firewall rules are changed by this component.").color(MUTED),
+            );
+        });
+        ui.add_space(16.0);
+        surface(ui, |ui| {
+            section_title(
+                ui,
+                "Current public destinations",
+                "Private, loopback, multicast and link-local addresses are excluded by default.",
+            );
+            ui.add_space(8.0);
+            match &self.last_net {
+                None => empty_state(
+                    ui,
+                    "No observation in this session",
+                    "The first run creates a baseline and does not claim destinations are safe.",
+                ),
+                Some(report) if report.connections.is_empty() => empty_state(
+                    ui,
+                    "No public connections observed",
+                    "Only established TCP and connected UDP sockets are included.",
+                ),
+                Some(report) => {
+                    egui::ScrollArea::vertical()
+                        .max_height(490.0)
+                        .show(ui, |ui| {
+                            for connection in &report.connections {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(&connection.protocol).monospace().color(BLUE),
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(
+                                                connection
+                                                    .process
+                                                    .as_deref()
+                                                    .unwrap_or("unknown process"),
+                                            )
+                                            .color(TEXT)
+                                            .strong(),
+                                        );
+                                        ui.label(
+                                            RichText::new(connection.remote.to_string())
+                                                .monospace()
+                                                .color(MUTED),
+                                        );
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            RichText::new(&connection.state)
+                                                .size(11.0)
+                                                .color(MUTED),
+                                        );
+                                    });
+                                });
+                                ui.separator();
+                            }
+                        });
+                }
+            }
+        });
+    }
+
+    fn reputation(&mut self, ui: &mut egui::Ui) {
+        self.header(
+            ui,
+            "Hash reputation",
+            "Exact local IOC matches by default; VirusTotal is explicit, hash-only and opt-in.",
+        );
+        if self.reputation_status.is_none() {
+            self.refresh_reputation_status();
+        }
+        ui.columns(2, |columns| {
+            surface(&mut columns[0], |ui| {
+                section_title(ui, "Local SHA-256 index", "Files never leave this laptop.");
+                ui.add_space(12.0);
+                let status = self.reputation_status.unwrap_or_default();
+                ui.label(
+                    RichText::new(status.local_hashes.to_string())
+                        .size(28.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new(format!("hashes from {} source(s)", status.local_sources))
+                        .color(MUTED),
+                );
+                ui.add_space(10.0);
+                if ui
+                    .add_enabled(
+                        !self.jobs.contains("reputation-sync"),
+                        egui::Button::new("Update hash feeds"),
+                    )
+                    .clicked()
+                {
+                    self.sync_reputation();
+                }
+            });
+            surface(&mut columns[1], |ui| {
+                section_title(
+                    ui,
+                    "VirusTotal",
+                    "Only the SHA-256 is sent; files are never uploaded.",
+                );
+                ui.add_space(12.0);
+                let enabled = self.deps.config.reputation.virustotal_enabled;
+                ui.label(
+                    RichText::new(if enabled { "ENABLED" } else { "DISABLED" })
+                        .color(if enabled { GREEN } else { MUTED })
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "API key environment: {}",
+                        self.deps.config.reputation.virustotal_api_key_env
+                    ))
+                    .monospace()
+                    .color(MUTED),
+                );
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.checkbox(
+                        &mut self.reputation_online,
+                        "Use online hash lookup for this check",
+                    );
+                });
+            });
+        });
+        ui.add_space(16.0);
+        surface(ui, |ui| {
+            section_title(
+                ui,
+                "Check one file",
+                "Local lookup is always performed first.",
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [ui.available_width() - 125.0, 36.0],
+                    egui::TextEdit::singleline(&mut self.reputation_path)
+                        .hint_text("/path/to/file"),
+                );
+                if ui
+                    .add_enabled(
+                        !self.jobs.contains("reputation-check"),
+                        egui::Button::new("Check hash"),
+                    )
+                    .clicked()
+                {
+                    self.check_reputation();
+                }
+            });
+            if let Some(result) = &self.reputation_result {
+                ui.add_space(12.0);
+                ui.label(RichText::new(&result.sha256).monospace().color(BLUE));
+                ui.label(
+                    RichText::new(format!(
+                        "Local: {}",
+                        result.local_match.as_deref().unwrap_or("not listed")
+                    ))
+                    .color(TEXT),
+                );
+                if let Some(vt) = &result.virustotal {
+                    ui.label(
+                        RichText::new(format!(
+                            "VirusTotal: {} · malicious {} · suspicious {} · harmless {}",
+                            vt.verdict, vt.malicious, vt.suspicious, vt.harmless
+                        ))
+                        .color(if vt.malicious > 0 {
+                            AMBER
+                        } else {
+                            MUTED
+                        }),
+                    );
+                }
+            }
+        });
+    }
+
+    fn cleanup(&mut self, ui: &mut egui::Ui) {
+        self.header(
+            ui,
+            "Cleanup & performance",
+            "Analyze first. Nothing is selected automatically and every deletion requires an exact phrase.",
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.jobs.contains("cleanup-scan") && !self.jobs.contains("cleanup-apply"),
+                    egui::Button::new("Analyze storage"),
+                )
+                .clicked()
+            {
+                self.run_cleanup_scan();
+            }
+            if self.jobs.contains("cleanup-scan") {
+                ui.spinner();
+                ui.label(RichText::new("Scanning bounded cleanup locations…").color(MUTED));
+            }
+            ui.label(
+                RichText::new("EFI, backups, snapshots and partial downloads are protected.")
+                    .color(MUTED),
+            );
+        });
+        ui.add_space(14.0);
+
+        if let Some(performance) = &self.cleanup_performance {
+            ui.columns(3, |columns| {
+                stat_card(
+                    &mut columns[0],
+                    "MEMORY AVAILABLE MiB",
+                    (performance.memory_available_bytes / (1024 * 1024)) as i64,
+                    GREEN,
+                );
+                stat_card(
+                    &mut columns[1],
+                    "MEMORY USED MiB",
+                    ((performance
+                        .memory_total_bytes
+                        .saturating_sub(performance.memory_available_bytes))
+                        / (1024 * 1024)) as i64,
+                    AMBER,
+                );
+                stat_card(
+                    &mut columns[2],
+                    "PROCESSES",
+                    performance.process_count as i64,
+                    BLUE,
+                );
+            });
+            ui.add_space(14.0);
+        }
+
+        let Some(report) = self.cleanup_report.clone() else {
+            surface(ui, |ui| {
+                empty_state(
+                    ui,
+                    "No cleanup analysis yet",
+                    "Select Analyze storage. The analysis itself is read-only.",
+                );
+            });
+            return;
+        };
+
+        ui.columns(3, |columns| {
+            cleanup_summary_card(
+                &mut columns[0],
+                "SAFE / REBUILDABLE",
+                report.safe_bytes,
+                GREEN,
+            );
+            cleanup_summary_card(
+                &mut columns[1],
+                "REVIEW REQUIRED",
+                report.review_bytes,
+                AMBER,
+            );
+            cleanup_summary_unknown_card(&mut columns[2], "PROTECTED / LIST ONLY", RED);
+        });
+        ui.add_space(14.0);
+
+        surface(ui, |ui| {
+            section_title(
+                ui,
+                "Cleanup candidates",
+                "Select only what you reviewed. Protected and elevated items cannot be selected here.",
+            );
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .max_height(350.0)
+                .show(ui, |ui| {
+                    for candidate in &report.candidates {
+                        let selectable = candidate.supported
+                            && !candidate.requires_root
+                            && candidate.risk != blue_cleanup::CleanupRisk::Protected;
+                        let mut selected = self.cleanup_selected.contains(&candidate.id);
+                        ui.horizontal(|ui| {
+                            let response =
+                                ui.add_enabled(selectable, egui::Checkbox::new(&mut selected, ""));
+                            if response.changed() {
+                                if selected {
+                                    self.cleanup_selected.insert(candidate.id.clone());
+                                } else {
+                                    self.cleanup_selected.remove(&candidate.id);
+                                }
+                                self.cleanup_confirmation.clear();
+                            }
+                            cleanup_risk_badge(ui, candidate.risk);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&candidate.label).color(TEXT).strong());
+                                ui.label(RichText::new(&candidate.reason).size(11.0).color(MUTED));
+                                if let Some(path) = &candidate.path {
+                                    ui.label(
+                                        RichText::new(path.to_string_lossy())
+                                            .size(10.0)
+                                            .monospace()
+                                            .color(MUTED),
+                                    );
+                                }
+                                if let Some(warning) = &candidate.warning {
+                                    ui.label(RichText::new(warning).size(10.0).color(AMBER));
+                                }
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(
+                                        if candidate.risk == blue_cleanup::CleanupRisk::Protected
+                                            && candidate.bytes == 0
+                                        {
+                                            "not sized".to_owned()
+                                        } else {
+                                            format_bytes(candidate.bytes)
+                                        },
+                                    )
+                                    .monospace()
+                                    .color(if selectable {
+                                        TEXT
+                                    } else {
+                                        MUTED
+                                    }),
+                                );
+                                if !selectable {
+                                    ui.label(
+                                        RichText::new("LIST ONLY").size(9.0).strong().color(RED),
+                                    );
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
+                });
+        });
+
+        ui.add_space(14.0);
+        let selected = report
+            .candidates
+            .iter()
+            .filter(|candidate| self.cleanup_selected.contains(&candidate.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        surface(ui, |ui| {
+            section_title(
+                ui,
+                "Explicit approval",
+                "The engine rescans and revalidates every selected path before deletion.",
+            );
+            if selected.is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Nothing selected — this is the default.").color(GREEN));
+            } else {
+                let required = blue_cleanup::CleanupEngine::required_confirmation(&selected);
+                let selected_bytes = selected
+                    .iter()
+                    .fold(0u64, |total, item| total.saturating_add(item.bytes));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} item(s), {} estimated. Type exactly:",
+                        selected.len(),
+                        format_bytes(selected_bytes)
+                    ))
+                    .color(TEXT),
+                );
+                ui.label(RichText::new(&required).monospace().strong().color(AMBER));
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [ui.available_width() - 145.0, 34.0],
+                        egui::TextEdit::singleline(&mut self.cleanup_confirmation)
+                            .hint_text("confirmation phrase"),
+                    );
+                    if ui
+                        .add_enabled(
+                            self.cleanup_confirmation == required
+                                && !self.jobs.contains("cleanup-apply"),
+                            egui::Button::new("Delete selected")
+                                .fill(Color32::from_rgb(64, 30, 36))
+                                .stroke(Stroke::new(1.0, RED)),
+                        )
+                        .clicked()
+                    {
+                        self.apply_cleanup();
+                    }
+                });
+            }
+            ui.add_space(8.0);
+            let setup_dir = extension_path()
+                .parent()
+                .map(|path| path.join("scripts"))
+                .unwrap_or_else(|| PathBuf::from("scripts"));
+            if ui.button("Copy system cleanup plan command").clicked() {
+                ui.ctx().copy_text(format!(
+                    "{} plan",
+                    setup_dir.join("cleanup-system.sh").display()
+                ));
+                self.message = Some(("Read-only system cleanup plan command copied".into(), true));
+            }
+        });
+
+        if let Some(performance) = &self.cleanup_performance {
+            ui.add_space(14.0);
+            surface(ui, |ui| {
+                section_title(
+                    ui,
+                    "Largest resident processes",
+                    "Observation only — Blue does not kill applications from Cleanup.",
+                );
+                for process in &performance.top_memory {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&process.name).color(TEXT));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format_bytes(process.rss_bytes))
+                                    .monospace()
+                                    .color(MUTED),
+                            );
+                            ui.label(
+                                RichText::new(format!("PID {}", process.pid))
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+        }
+    }
+
     fn quarantine(&mut self, ui: &mut egui::Ui) {
         self.header(
             ui,
@@ -986,6 +1748,7 @@ impl BlueApp {
                     "Removes sponsored search-result cards",
                     "Warns before opening suspicious links",
                     "Blocks known ad and tracker requests",
+                    "Checks search links against the desktop domain feed",
                     "Keeps settings in the browser profile",
                 ] {
                     ui.horizontal(|ui| {
@@ -1053,6 +1816,38 @@ impl BlueApp {
             ui.separator();
             if protection_row(
                 ui,
+                "Observe new egress every 5 minutes",
+                "Read-only connection inventory; no firewall enforcement",
+                &mut self.net_timer,
+            ) {
+                match set_user_unit("blue-net.timer", self.net_timer) {
+                    Ok(()) => {
+                        self.message = Some(("Network observation schedule updated".into(), true))
+                    }
+                    Err(error) => {
+                        self.net_timer = !self.net_timer;
+                        self.message = Some((format!("Timer control failed: {error:#}"), false));
+                    }
+                }
+            }
+            ui.separator();
+            if protection_row(
+                ui,
+                "Daily malicious-hash feed updates",
+                "Exact SHA-256 IOCs remain local",
+                &mut self.reputation_timer,
+            ) {
+                match set_user_unit("blue-reputation.timer", self.reputation_timer) {
+                    Ok(()) => self.message = Some(("Hash feed schedule updated".into(), true)),
+                    Err(error) => {
+                        self.reputation_timer = !self.reputation_timer;
+                        self.message = Some((format!("Timer control failed: {error:#}"), false));
+                    }
+                }
+            }
+            ui.separator();
+            if protection_row(
+                ui,
                 "Daily filter updates",
                 "Runs blue-feeds.timer as your user",
                 &mut self.feed_timer,
@@ -1112,6 +1907,30 @@ impl BlueApp {
                 ui.separator();
             }
             ui.add_space(8.0);
+            section_title(
+                ui,
+                "Confirmed system setup",
+                "These plans are read-only until you run their explicit confirmation command.",
+            );
+            let setup_dir = extension_path()
+                .parent()
+                .map(|path| path.join("scripts"))
+                .unwrap_or_else(|| PathBuf::from("scripts"));
+            for (label, script) in [
+                ("ClamAV", setup_dir.join("setup-clamav.sh")),
+                ("System DNS", setup_dir.join("setup-system-dns.sh")),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(label).color(MUTED).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Copy plan command").clicked() {
+                            ui.ctx().copy_text(format!("{} plan", script.display()));
+                            self.message = Some((format!("{label} plan command copied"), true));
+                        }
+                    });
+                });
+            }
+            ui.add_space(8.0);
             ui.label(
                 RichText::new(
                     "This app is a native executable. It opens no listening HTTP port and contains no web view.",
@@ -1139,10 +1958,21 @@ impl eframe::App for BlueApp {
                 Page::Overview => self.overview(ui),
                 Page::Scanner => self.scanner(ui),
                 Page::Integrity => self.integrity(ui),
+                Page::Network => self.network(ui),
+                Page::Reputation => self.reputation(ui),
+                Page::Cleanup => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("cleanup-page")
+                        .show(ui, |ui| self.cleanup(ui));
+                }
                 Page::Quarantine => self.quarantine(ui),
                 Page::Filters => self.filters(ui),
                 Page::Browser => self.browser(ui),
-                Page::Settings => self.settings(ui),
+                Page::Settings => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings-page")
+                        .show(ui, |ui| self.settings(ui));
+                }
             });
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
@@ -1254,6 +2084,78 @@ fn stat_card(ui: &mut egui::Ui, label: &str, value: i64, color: Color32) {
             });
         });
     });
+}
+
+fn cleanup_summary_card(ui: &mut egui::Ui, label: &str, bytes: u64, color: Color32) {
+    surface(ui, |ui| {
+        ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
+        ui.add_space(5.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format_bytes(bytes))
+                    .size(24.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new("●").color(color));
+            });
+        });
+    });
+}
+
+fn cleanup_summary_unknown_card(ui: &mut egui::Ui, label: &str, color: Color32) {
+    surface(ui, |ui| {
+        ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
+        ui.add_space(5.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("not enumerated")
+                    .size(18.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new("●").color(color));
+            });
+        });
+    });
+}
+
+fn cleanup_risk_badge(ui: &mut egui::Ui, risk: blue_cleanup::CleanupRisk) {
+    let (label, color) = match risk {
+        blue_cleanup::CleanupRisk::Safe => ("SAFE", GREEN),
+        blue_cleanup::CleanupRisk::Review => ("REVIEW", AMBER),
+        blue_cleanup::CleanupRisk::Protected => ("PROTECTED", RED),
+    };
+    Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            28,
+        ))
+        .stroke(Stroke::new(1.0, color))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(7, 3))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).size(9.0).strong().color(color));
+        });
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn mini_stat(ui: &mut egui::Ui, label: &str, value: usize) {

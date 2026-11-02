@@ -11,6 +11,9 @@ blue-scan = { path = "../blue-scan" }
 blue-guard = { path = "../blue-guard" }
 blue-feeds = { path = "../blue-feeds" }
 blue-dns = { path = "../blue-dns" }
+blue-net = { path = "../blue-net" }
+blue-reputation = { path = "../blue-reputation" }
+blue-cleanup = { path = "../blue-cleanup" }
 anyhow.workspace = true
 eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "system_fonts"] }
 tokio.workspace = true

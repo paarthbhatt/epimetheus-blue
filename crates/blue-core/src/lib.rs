@@ -13,7 +13,7 @@ pub use config::Config;
 pub use db::Db;
 pub use model::{
     Artifact, Confidence, Counts, Dataset, Detector, DetectorResult, Event, Finding, Quarantined,
-    Tier,
+    ReputationRecord, Tier,
 };
 pub use quarantine::{Quarantine, StoredItem};
 pub use verdict::{classify, escalate_if_confirmed, reason};

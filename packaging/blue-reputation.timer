@@ -1,0 +1,12 @@
+[Unit]
+Description=Update Epimetheus Blue malicious-hash feeds daily
+
+[Timer]
+OnBootSec=12min
+OnUnitActiveSec=1d
+RandomizedDelaySec=30min
+Persistent=true
+Unit=blue-reputation.service
+
+[Install]
+WantedBy=timers.target

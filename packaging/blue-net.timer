@@ -1,0 +1,12 @@
+[Unit]
+Description=Observe new Epimetheus Blue egress destinations every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=20s
+Persistent=true
+Unit=blue-net.service
+
+[Install]
+WantedBy=timers.target

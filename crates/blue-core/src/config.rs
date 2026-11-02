@@ -13,6 +13,83 @@ pub struct Config {
     pub dns: Dns,
     pub guard: Guard,
     pub feeds: Feeds,
+    pub reputation: Reputation,
+    pub network: Network,
+    pub cleanup: Cleanup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cleanup {
+    pub scan_roots: Vec<String>,
+    pub download_age_days: u64,
+    pub build_artifact_depth: usize,
+    pub max_candidates: usize,
+}
+
+impl Default for Cleanup {
+    fn default() -> Self {
+        Self {
+            scan_roots: vec![
+                "~/Projects".into(),
+                "~/company".into(),
+                "~/Desktop".into(),
+                "~/Downloads".into(),
+            ],
+            download_age_days: 30,
+            build_artifact_depth: 5,
+            max_candidates: 2_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Reputation {
+    pub local_dir: String,
+    pub sources: Vec<FeedSource>,
+    /// VirusTotal is hash-only and opt-in. Files are never uploaded.
+    pub virustotal_enabled: bool,
+    pub virustotal_query_on_scan: bool,
+    pub virustotal_api_key_env: String,
+    pub virustotal_min_malicious: u32,
+    pub cache_hours: u64,
+}
+
+impl Default for Reputation {
+    fn default() -> Self {
+        Self {
+            local_dir: "~/.local/share/blue/hash-feeds".into(),
+            sources: vec![FeedSource {
+                name: "signature-base".into(),
+                url: "https://raw.githubusercontent.com/Neo23x0/signature-base/master/iocs/hash-iocs.txt".into(),
+                license: Some("Detection Rule License 1.1".into()),
+            }],
+            virustotal_enabled: false,
+            virustotal_query_on_scan: false,
+            virustotal_api_key_env: "VIRUSTOTAL_API_KEY".into(),
+            virustotal_min_malicious: 3,
+            cache_hours: 168,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Network {
+    pub ignore_private: bool,
+    pub interval_minutes: u64,
+    pub max_connections: usize,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            ignore_private: true,
+            interval_minutes: 5,
+            max_connections: 20_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,7 +165,10 @@ impl Default for Dns {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:53".into(),
-            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+            upstreams: vec![
+                "tls://1.1.1.1:853#cloudflare-dns.com".into(),
+                "tls://9.9.9.9:853#dns.quad9.net".into(),
+            ],
             block_response: "nxdomain".into(),
         }
     }
@@ -181,14 +261,18 @@ impl Default for Yara {
 
 impl Config {
     /// Load `/etc/blue/config.toml`, then `~/.config/blue/config.toml`, then an
-    /// explicit path. Later files win field-by-field at the TOML layer.
+    /// explicit path. Sorted `conf.d/*.toml` drop-ins are loaded after each
+    /// corresponding main file. Later files win field-by-field.
     pub fn load(explicit: Option<&Path>) -> Result<Config> {
         let mut merged = toml::Value::try_from(Config::default())
             .context("serializing default configuration")?;
         let mut candidates: Vec<PathBuf> = Vec::new();
         candidates.push(PathBuf::from("/etc/blue/config.toml"));
+        push_drop_ins(Path::new("/etc/blue/conf.d"), &mut candidates)?;
         if let Some(home) = home_dir() {
-            candidates.push(home.join(".config/blue/config.toml"));
+            let root = home.join(".config/blue");
+            candidates.push(root.join("config.toml"));
+            push_drop_ins(&root.join("conf.d"), &mut candidates)?;
         }
         if let Some(p) = explicit {
             candidates.push(p.to_path_buf());
@@ -241,8 +325,44 @@ impl Config {
         if self.scan.max_file_size_mb == 0 {
             anyhow::bail!("scan.max_file_size_mb must be greater than zero");
         }
+        if self.reputation.virustotal_min_malicious == 0 {
+            anyhow::bail!("reputation.virustotal_min_malicious must be greater than zero");
+        }
+        if self.reputation.cache_hours == 0 {
+            anyhow::bail!("reputation.cache_hours must be greater than zero");
+        }
+        if self.reputation.virustotal_enabled
+            && self.reputation.virustotal_api_key_env.trim().is_empty()
+        {
+            anyhow::bail!("reputation.virustotal_api_key_env cannot be empty when enabled");
+        }
+        if self.network.interval_minutes == 0 || self.network.max_connections == 0 {
+            anyhow::bail!("network interval and connection cap must be greater than zero");
+        }
+        if self.cleanup.download_age_days == 0
+            || self.cleanup.build_artifact_depth == 0
+            || self.cleanup.max_candidates == 0
+        {
+            anyhow::bail!("cleanup age, depth and candidate cap must be greater than zero");
+        }
         Ok(())
     }
+}
+
+fn push_drop_ins(directory: &Path, candidates: &mut Vec<PathBuf>) -> Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    let mut paths = std::fs::read_dir(directory)
+        .with_context(|| format!("reading config drop-ins from {}", directory.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("toml")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    candidates.extend(paths);
+    Ok(())
 }
 
 fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
@@ -323,5 +443,20 @@ mod tests {
         config.scan.mode = "inotify".into();
         config.dns.block_response = "redirect".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_drop_ins_are_sorted_and_toml_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("20-second.toml"), "").unwrap();
+        std::fs::write(dir.path().join("10-first.toml"), "").unwrap();
+        std::fs::write(dir.path().join("ignore.txt"), "").unwrap();
+        let mut found = Vec::new();
+        push_drop_ins(dir.path(), &mut found).unwrap();
+        let names = found
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["10-first.toml", "20-second.toml"]);
     }
 }

@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Epimetheus Blue Search Guard",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Search-result cleanup, tracking-link removal, and local ad/malware domain blocking.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvvAkjAWA02YsARyHZMcXuqwrPjd+WH1OH7bKQYPH7FSoF51dm2jLaEJjbfV0SBIk6vblG8ir9cGkrIa5L++TdH+CXpR0UiOnONEXwMmu7gCHuBoS4n307mQJy3HA+evIiefyZBgfL7qb8RatBtUIDWwiTZ7fLjJ8dRUOtDbvu26pasPZ4ieMPGgNf8rGTlQzVqpUxI5StXRV2UlvRo7OSHrpkSCKfdlpbCkQ3NcFTA8NPGcWG6BsuTUX3p1xV4oarhxP35bWp6J0vAMHh6BCFCGbbtkExFehERDlHkkg8Bj0jW3gdcXew+6inoxHjrwx2hMFtCbbK5n902Kn3dMxmQIDAQAB",
   "permissions": [
     "storage",
     "activeTab",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "nativeMessaging"
   ],
   "host_permissions": ["<all_urls>"],
   "action": {

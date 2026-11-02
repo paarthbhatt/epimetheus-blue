@@ -123,6 +123,10 @@ blue/
 │   ├── blue-dns/               # UDP resolver, blocklist parser, suffix matcher
 │   ├── blue-guard/             # hashing, FIM, persistence inventory, pacman drift
 │   ├── blue-feeds/             # fetch, verify, activate, rollback datasets
+│   ├── blue-reputation/        # local SHA-256 index + opt-in VT hash lookup
+│   ├── blue-net/               # read-only procfs egress observer
+│   ├── blue-native-host/       # bounded read-only browser messaging
+│   ├── blue-cleanup/           # risk-classified storage/performance inventory
 │   └── blue-ui/                # native eframe/egui Wayland/X11 application
 ├── browser-extension/          # Chromium/Brave MV3 search companion
 ├── packaging/                  # desktop entry and systemd user units
@@ -138,6 +142,9 @@ blue/
 | `blue-dns` | logged-in user | port 53 requires one-time external capability/setup | Resolver is never silently privileged by the installer |
 | `blue-guard.timer` | logged-in user | read access to configured startup paths | Read-only by design |
 | `blue-feeds.timer` | logged-in user | network egress | Downloads and validates DNS datasets |
+| `blue-net.timer` | logged-in user | read-only procfs access | Observes the user's connected sockets; never edits firewall state |
+| `blue-reputation.timer` | logged-in user | network egress | Downloads exact SHA-256 IOC lists; no samples |
+| browser native host | browser-launched user process | stdin/stdout only | Read-only status, findings and bounded domain checks |
 
 **No service runs as root.** Where root would normally be required:
 
@@ -235,6 +242,8 @@ on a developer workstation ("something added a systemd user unit I did not write
   `max_rule_scan` guard.
 - Prefilter: exclusion globs and a 512 MiB default size cap. Oversized files are
   skipped without spending the same I/O budget hashing them first.
+- Realtime desktop notifications are best-effort and only emitted after a T2+
+  verdict actually enters quarantine; candidates never interrupt the user.
 
 ### 4.3 `blue-dns`
 
@@ -242,7 +251,9 @@ on a developer workstation ("something added a systemd user unit I did not write
   question and never panics on malformed datagrams.
 - Blocklists accept hosts, bare-domain and common Adblock anchor formats, then use
   exact label-boundary suffix matching. Allowlists always win.
-- Upstreams are UDP in this build. DoT remains a future seam, not a current claim.
+- Upstreams support UDP and certificate-validated DNS-over-TLS (RFC 7858). A
+  selected DoT endpoint never falls back to plaintext. The current campus network
+  blocks port 853, so confirmed system setup preserves its internal UDP DNS.
 - Bind conflicts and permission errors are returned visibly to the native app.
 
 ### 4.4 `blue-guard`
@@ -276,6 +287,40 @@ on a developer workstation ("something added a systemd user unit I did not write
 - The Chromium/Brave Manifest V3 companion is deliberately separate. It removes
   sponsored search cards, strips tracking parameters, provides safe-search
   shortcuts and applies conservative DNR domain rules. It loads no remote code.
+- A read-only native-messaging host batches visible search-result domains against
+  the full desktop blocklist. The list is not copied into DNR because browser
+  quota is smaller than the local dataset.
+
+### 4.7 `blue-reputation`
+
+- Loads exact SHA-256 IOCs from validated local feeds; MD5/SHA-1 are ignored.
+- Local matches are high-confidence hash signals and participate in the same T2
+  quarantine gate as the other detectors.
+- VirusTotal is opt-in, hash-only, environment-keyed and cached. No file upload
+  endpoint exists in the implementation. Explicit online checks are the default;
+  automatic scan queries remain off.
+
+### 4.8 `blue-net`
+
+- Parses the logged-in user's established TCP and connected UDP sockets from
+  procfs and best-effort maps socket inodes to process names.
+- The first run establishes a public-destination baseline. Later new destinations
+  are T1 observations worded as new, never as malicious.
+- No packet capture, nftables mutation, process kill, or default-deny mode exists.
+
+### 4.9 `blue-cleanup`
+
+- Inventory and execution are separate. Scans never select or delete anything.
+- Candidates are **Safe** (narrow reproducible caches), **Review** (trash,
+  downloads and build artifacts with a real recovery cost), or **Protected**
+  (EFI, snapshots, backups, partial downloads and application sandboxes).
+- User-owned deletion requires explicit IDs plus an exact generated phrase, then
+  a fresh rescan, candidate-ID resolution, file-type, symlink and mount checks.
+- System-owned cleanup uses a separate owner-tool plan and distinct confirmation
+  gates. EFI and arbitrary backups have no deletion implementation.
+- Performance diagnostics are observation-only: memory availability, swap,
+  process count and top resident processes. Blue never kills an application from
+  the Cleanup page.
 
 ---
 
@@ -529,10 +574,12 @@ ClamAV remains a distro package and `freshclam` remains its own updater.
 ### Bootstrap order
 
 ```bash
-pacman -S clamav        # YARA-X is embedded, see ADR-3
-systemctl enable --now clamav-daemon clamav-freshclam
+scripts/setup-clamav.sh plan
+scripts/setup-clamav.sh install --confirm-package-install
 blue verify             # DB, units, feeds, detectors
 blue feeds sync
+blue reputation sync
+blue network            # establish read-only egress baseline
 blue drill              # end-to-end proof the pipeline works
 blue scan ~/Downloads
 ```
@@ -552,11 +599,15 @@ a real sample.
 | ADR-2 | inotify by default, fanotify documented but off | fanotify — needs `CAP_SYS_ADMIN`, permission events block opens |
 | ADR-3 | `yara-x` embedded engine, not the `yara` CLI | shelling out per file — process spawn dominates scan time |
 | ADR-4 | `clamd` over Unix socket, not `clamscan` per file | per-file process — same reason |
-| ADR-5 | Minimal Tokio UDP resolver, not Unbound/Blocky | external daemon — loses in-process controls; full DNS stack is YAGNI for a sinkhole |
+| ADR-5 | Minimal Tokio UDP/DoT resolver, not Unbound/Blocky | external daemon — loses in-process controls; full DNS stack is YAGNI for a sinkhole |
 | ADR-6 | Quarantine only, delete never | auto-delete — irreversible, and the usual cause of data loss |
 | ADR-7 | DNS sinkhole, no TLS interception | MITM proxy — breaks cert validation, bigger attack surface |
 | ADR-8 | Native eframe/egui app, no loopback HTTP | web dashboard/Electron — unnecessary listener/runtime for one local user |
 | ADR-9 | Separate MV3 browser companion | TLS MITM or all-page DOM inspection — excessive privilege and breakage |
+| ADR-10 | Local exact-hash IOC feed; VirusTotal hash-only and explicit | automatic file uploads — unacceptable privacy boundary |
+| ADR-11 | Read-only egress baselining | default-deny firewall — breakage and lockout risk exceeds personal value |
+| ADR-12 | Read-only bounded browser native host | copying the full feed into DNR — browser quota and update churn |
+| ADR-13 | Scan-first allowlisted cleanup with typed confirmation | generic “clean everything” commands — data-loss and TOCTOU risk |
 
 ---
 
@@ -569,7 +620,9 @@ a real sample.
 | 2 | Watcher, integrity/persistence guard, package drift | complete |
 | 3 | Native control center, versioned feeds, systemd user timers | complete |
 | 4 | Chromium/Brave search companion | complete |
-| Future | DoT upstream, notifications, opt-in hash reputation | not claimed |
+| 5 | DoT, local/optional VT reputation, egress observer, native browser bridge | complete |
+| 6 | Risk-classified cleanup and performance inventory | complete |
+| System activation | ClamAV package and NetworkManager loopback DNS | confirmation-gated, not silently applied |
 
 Phase 0 is designed to be useful on day one and dangerous to nothing.
 
@@ -600,18 +653,12 @@ Each is a scripted, repeatable test. If a drill fails, the release is not done.
 
 ## 14. Open questions
 
-1. **Hash reputation backend.** VirusTotal is the obvious choice but sends hashes
-   to a third party. Opt-in, hash-only (never upload files), or skip entirely and
-   rely on local signals? Default posture in this design: skip, stub the seam.
-2. **Blocklist providers.** Which lists to ship as defaults is a licensing and
+1. **Blocklist providers.** Which lists to ship as defaults is a licensing and
    taste decision. Every source must record its license and fetch URL; none are
    vendored.
-3. **Notifications.** Desktop notifications via `notify-send` are trivial, but a
-   noisy security tool trains the user to dismiss it. Proposal: one digest per
-   day plus immediate alerts only at T3.
-4. **System-path scanning.** Report-only, or allow quarantine with an explicit
+2. **System-path scanning.** Report-only, or allow quarantine with an explicit
    per-action confirmation? Current design: report-only.
-5. **Name.** `Epimetheus Blue` is a working title that pairs with the Red work.
+3. **Name.** `Epimetheus Blue` is a working title that pairs with the Red work.
    Renaming costs a `sed` today and a migration later.
 
 ---
@@ -630,7 +677,7 @@ Not "zero infections". Success is:
 
 ## 16. Implementation status
 
-Built on 2026-11-02. `blue drill` passes end to end; the resolver and browser
+Built on 2026-11-03. `blue drill` passes end to end; the resolver and browser
 extension have live smoke tests. The current workspace test count is recorded in
 the release summary rather than hard-coded here.
 
@@ -638,12 +685,17 @@ the release summary rather than hard-coded here.
 |---|---|
 | `blue-core` (config, SQLite, verdict, quarantine) | implemented |
 | `blue-scan` (YARA-X, clamd, watcher) | implemented |
-| `blue-dns` (suffix blocklist, UDP sinkhole/forwarder) | implemented |
+| `blue-dns` (suffix blocklist, UDP + authenticated DoT) | implemented |
 | `blue-ui` (native Wayland/X11 app, kill switch) | implemented |
 | `blue-guard` (FIM, persistence audit, package drift) | implemented |
 | `blue-feeds` (validated dataset sync, rollback) | implemented |
-| Chromium/Brave MV3 search companion | implemented |
+| `blue-reputation` (local SHA-256 + optional VT hash lookup) | implemented |
+| `blue-net` (read-only egress baseline) | implemented |
+| `blue-native-host` (read-only browser bridge) | implemented |
+| `blue-cleanup` (risk inventory, explicit user-owned apply, performance snapshot) | implemented |
+| Chromium/Brave MV3 search companion | implemented, stable extension ID |
 | systemd user units + desktop entry | implemented |
+| reversible ClamAV and NetworkManager setup | implemented; privileged apply awaits confirmation |
 
 ### Deviations from the design above
 
@@ -653,15 +705,15 @@ These are deliberate and cheap to reverse. Listed so the doc does not drift.
    addressing would force a decision about what to do with a second file that has
    the same hash — and every answer except "keep both" involves deleting one.
    The hash is still recorded on every record.
-2. **Default state dir is `~/.local/share/blue`.** The design assumed a system
-   user and `/var/lib/blue`. Running unprivileged was the safer first step; the
-   `blue@.service` template documents the hardened system install.
+2. **Default state dir is `~/.local/share/blue`.** Running as the logged-in user
+   keeps one-machine ownership simple; hardened user units isolate background jobs.
 3. **YARA-X is built with `default-features = false`.** The default feature set
    pulls in parsers and modules that the current plain-string rules do not use.
    YARA-X core still brings its own runtime; this switch trims optional modules,
    not the entire dependency graph. Re-enable only what a future dataset needs.
-4. **DNS upstreams are plaintext UDP in this build.** DoT is the documented next
-   step; the config already carries upstream addresses, so no API change.
+4. **DoT is available but the current campus network blocks port 853.** The
+   reversible system setup therefore preserves its private DNS servers as UDP
+   upstreams instead of breaking internal names or silently downgrading DoT.
 5. **`blue scan` has no `--json` yet.** It prints a table and a summary line;
    SQLite is the durable machine-readable state.
 6. **Oversized files are recorded as T0 with no hash and no row**, rather than
@@ -672,5 +724,9 @@ These are deliberate and cheap to reverse. Listed so the doc does not drift.
 - Suffix matching blocks `x.ads.example.com` and not `notads.example.com`.
 - A ClamAV hit alone reaches T2; a single low-confidence YARA hit stays at T1.
 - Kill switch on: verdict recorded, nothing moved.
+- A local exact SHA-256 IOC produces a high-confidence hash signal; VT remains off
+  unless both configuration and an explicit online check permit it.
+- Egress observation reports new destinations once and never edits nftables.
+- The browser native host has no mutating message type.
 - Restore refuses to overwrite a file that reappeared at the original path.
 - Stopping `clamd` degrades the scanner instead of failing closed.

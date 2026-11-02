@@ -4,7 +4,7 @@
 //! same file several times in quick succession, and there is no value in
 //! scanning every intermediate state.
 
-use crate::ScanEngine;
+use crate::{ScanEngine, ScanOutcome};
 use anyhow::{Context, Result};
 use notify::{RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -94,11 +94,36 @@ fn run(
 
         for path in ready {
             pending.remove(&path);
-            if let Err(e) = engine.scan_path(&path) {
-                // A single unreadable or vanished file never stops the watcher.
-                tracing::warn!(path = %path.display(), error = %e, "scan failed");
+            match engine.scan_path(&path) {
+                Ok(outcome) => notify_if_actionable(&outcome),
+                Err(e) => {
+                    // A single unreadable or vanished file never stops the watcher.
+                    tracing::warn!(path = %path.display(), error = %e, "scan failed");
+                }
             }
         }
+    }
+}
+
+/// Realtime alerts are intentionally rare: only a corroborated verdict that
+/// caused quarantine merits an interruption. `notify-send` is best-effort and
+/// never participates in the security decision.
+fn notify_if_actionable(outcome: &ScanOutcome) {
+    let Some(id) = outcome.quarantined else {
+        return;
+    };
+    let body = format!("{}\nQuarantine item #{id}", outcome.path.to_string_lossy());
+    if let Err(error) = std::process::Command::new("notify-send")
+        .args([
+            "--app-name=Epimetheus Blue",
+            "--urgency=critical",
+            "--icon=security-high",
+            "Threat quarantined",
+            &body,
+        ])
+        .spawn()
+    {
+        tracing::debug!(%error, "desktop notification unavailable");
     }
 }
 

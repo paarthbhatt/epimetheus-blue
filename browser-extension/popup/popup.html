@@ -33,6 +33,20 @@
       <label><span>Strict safe search</span><input id="safeSearch" type="checkbox"><i></i></label>
     </section>
 
+    <div class="desktop">
+      <div class="desktop-heading">
+        <span>Desktop: <b id="desktop-state">Checking…</b></span>
+        <button id="refresh-native" type="button">Refresh</button>
+      </div>
+      <div class="native-counts">
+        <span><b id="native-artifacts">—</b> artifacts</span>
+        <span><b id="native-findings">—</b> findings</span>
+        <span><b id="native-quarantined">—</b> quarantined</span>
+        <span><b id="native-blocked">—</b> DNS blocks</span>
+      </div>
+      <p id="desktop-detail">Waiting for the local app</p>
+    </div>
+
     <div class="stats">
       <div><b id="removed">—</b><span>ads hidden</span></div>
       <div><b id="cleaned">—</b><span>links cleaned</span></div>

@@ -178,3 +178,15 @@ pub struct Counts {
     pub findings: i64,
     pub blocked: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReputationRecord {
+    pub sha256: String,
+    pub source: String,
+    pub verdict: String,
+    pub malicious: i64,
+    pub suspicious: i64,
+    pub harmless: i64,
+    pub checked_at_ms: i64,
+    pub detail: String,
+}

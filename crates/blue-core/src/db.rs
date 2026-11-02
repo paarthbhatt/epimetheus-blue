@@ -1,6 +1,8 @@
 //! SQLite state. One writer, WAL, no ORM.
 
-use crate::model::{Artifact, Counts, Dataset, DetectorResult, Event, Finding, Quarantined, Tier};
+use crate::model::{
+    Artifact, Counts, Dataset, DetectorResult, Event, Finding, Quarantined, ReputationRecord, Tier,
+};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -81,6 +83,18 @@ CREATE TABLE IF NOT EXISTS datasets (
   size         INTEGER,
   activated_ms INTEGER NOT NULL,
   active       INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS reputation_cache (
+  sha256       TEXT NOT NULL,
+  source       TEXT NOT NULL,
+  verdict      TEXT NOT NULL,
+  malicious    INTEGER NOT NULL DEFAULT 0,
+  suspicious   INTEGER NOT NULL DEFAULT 0,
+  harmless     INTEGER NOT NULL DEFAULT 0,
+  checked_ms   INTEGER NOT NULL,
+  detail       TEXT NOT NULL,
+  PRIMARY KEY (sha256, source)
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -492,6 +506,55 @@ impl Db {
         })
     }
 
+    pub fn reputation(&self, sha256: &str, source: &str) -> Result<Option<ReputationRecord>> {
+        let c = self.lock();
+        Ok(c.query_row(
+            "SELECT sha256, source, verdict, malicious, suspicious, harmless, checked_ms, detail
+                 FROM reputation_cache WHERE sha256 = ?1 AND source = ?2",
+            params![sha256, source],
+            |row| {
+                Ok(ReputationRecord {
+                    sha256: row.get(0)?,
+                    source: row.get(1)?,
+                    verdict: row.get(2)?,
+                    malicious: row.get(3)?,
+                    suspicious: row.get(4)?,
+                    harmless: row.get(5)?,
+                    checked_at_ms: row.get(6)?,
+                    detail: row.get(7)?,
+                })
+            },
+        )
+        .optional()?)
+    }
+
+    pub fn upsert_reputation(&self, record: &ReputationRecord) -> Result<()> {
+        let c = self.lock();
+        c.execute(
+            "INSERT INTO reputation_cache
+               (sha256, source, verdict, malicious, suspicious, harmless, checked_ms, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(sha256, source) DO UPDATE SET
+               verdict = excluded.verdict,
+               malicious = excluded.malicious,
+               suspicious = excluded.suspicious,
+               harmless = excluded.harmless,
+               checked_ms = excluded.checked_ms,
+               detail = excluded.detail",
+            params![
+                record.sha256,
+                record.source,
+                record.verdict,
+                record.malicious,
+                record.suspicious,
+                record.harmless,
+                record.checked_at_ms,
+                record.detail
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let c = self.lock();
         c.execute(
@@ -555,5 +618,28 @@ mod tests {
         assert!(!db.kill_switch());
         db.set_kill_switch(true).unwrap();
         assert!(db.kill_switch());
+    }
+
+    #[test]
+    fn reputation_cache_roundtrip() {
+        let db = Db::open_memory().unwrap();
+        let record = ReputationRecord {
+            sha256: "a".repeat(64),
+            source: "test".into(),
+            verdict: "malicious".into(),
+            malicious: 7,
+            suspicious: 1,
+            harmless: 0,
+            checked_at_ms: 42,
+            detail: "{}".into(),
+        };
+        db.upsert_reputation(&record).unwrap();
+        let loaded = db
+            .reputation(&record.sha256, &record.source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.verdict, "malicious");
+        assert_eq!(loaded.malicious, 7);
+        assert_eq!(loaded.checked_at_ms, 42);
     }
 }
