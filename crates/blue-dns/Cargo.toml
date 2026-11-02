@@ -1,0 +1,19 @@
+[package]
+name = "blue-dns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blue-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+hickory-server = "0.26"
+hickory-proto = "0.26"
+hickory-resolver = "0.26"
+serde.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

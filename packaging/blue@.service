@@ -1,0 +1,36 @@
+[Unit]
+Description=blue %i
+Documentation=file:///home/batman/Projects/epimetheus-blue/docs/DESIGN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# One template, several roles: blue@daemon, blue@watch, blue@dns
+ExecStart=/usr/bin/blue %i
+Restart=on-failure
+RestartSec=5
+
+# Hardening. The tool must not become the attack surface.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+MemoryMax=512M
+TasksMax=64
+
+# The only writable path is the state directory.
+ReadWritePaths=%h/.local/share/blue
+
+[Install]
+WantedBy=default.target
