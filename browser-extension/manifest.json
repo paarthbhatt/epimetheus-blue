@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "Epimetheus Blue Search Guard",
+  "version": "0.2.0",
+  "description": "Search-result cleanup, tracking-link removal, and local ad/malware domain blocking.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "Blue Search Guard",
+    "default_popup": "popup/popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "omnibox": {
+    "keyword": "blue"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.google.com/search*",
+        "https://www.google.co.uk/search*",
+        "https://www.google.ca/search*",
+        "https://www.google.de/search*",
+        "https://www.google.fr/search*",
+        "https://www.google.com.au/search*",
+        "https://www.google.co.jp/search*",
+        "https://www.google.co.in/search*",
+        "https://www.bing.com/search*",
+        "https://duckduckgo.com/*",
+        "https://search.brave.com/search*"
+      ],
+      "js": ["content/search-guard.js"],
+      "css": ["content/search-guard.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "blue_default_filters",
+        "enabled": true,
+        "path": "rules/default-rules.json"
+      }
+    ]
+  },
+  "minimum_chrome_version": "120"
+}

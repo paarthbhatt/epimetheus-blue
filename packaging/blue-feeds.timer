@@ -1,0 +1,12 @@
+[Unit]
+Description=Update Epimetheus Blue filter feeds daily
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1d
+RandomizedDelaySec=30min
+Persistent=true
+Unit=blue-feeds.service
+
+[Install]
+WantedBy=timers.target

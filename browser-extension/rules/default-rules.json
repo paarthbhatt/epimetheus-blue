@@ -1,0 +1,17 @@
+[
+  {"id":1,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["doubleclick.net"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":2,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["googlesyndication.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":3,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["googleadservices.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":4,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["adservice.google.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":5,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["adsrvr.org"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":6,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["criteo.com","criteo.net"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":7,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["taboola.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":8,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["outbrain.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":9,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["scorecardresearch.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":10,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["quantserve.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":11,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["amazon-adsystem.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":12,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["ads-twitter.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":13,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["hotjar.com","hotjar.io"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":14,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["moatads.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}},
+  {"id":15,"priority":1,"action":{"type":"block"},"condition":{"requestDomains":["adnxs.com"],"resourceTypes":["sub_frame","script","image","xmlhttprequest","ping","media","other"]}}
+]

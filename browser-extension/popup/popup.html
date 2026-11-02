@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blue Search Guard</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="shield">✓</div>
+    <div><small>EPIMETHEUS</small><h1>Blue Search Guard</h1></div>
+    <span id="state-dot" class="dot"></span>
+  </header>
+
+  <form id="search-form" class="search">
+    <input id="search-query" type="search" placeholder="Search privately…" autocomplete="off">
+    <button type="submit" aria-label="Search">⌕</button>
+  </form>
+  <select id="search-provider" aria-label="Search provider">
+    <option value="duckduckgo">DuckDuckGo</option>
+    <option value="brave">Brave Search</option>
+    <option value="google">Google</option>
+    <option value="bing">Bing</option>
+  </select>
+
+  <main>
+    <label class="master"><span><b>Protection</b><em id="protection-label">Active</em></span><input id="enabled" type="checkbox"><i></i></label>
+    <section>
+      <label><span>Remove sponsored results</span><input id="cleanSponsored" type="checkbox"><i></i></label>
+      <label><span>Strip tracking parameters</span><input id="stripTracking" type="checkbox"><i></i></label>
+      <label><span>Warn on blocked links</span><input id="warnBlocked" type="checkbox"><i></i></label>
+      <label><span>Strict safe search</span><input id="safeSearch" type="checkbox"><i></i></label>
+    </section>
+
+    <div class="stats">
+      <div><b id="removed">—</b><span>ads hidden</span></div>
+      <div><b id="cleaned">—</b><span>links cleaned</span></div>
+      <div><b id="warned">—</b><span>warnings</span></div>
+    </div>
+
+    <div class="site">
+      <span id="site-domain">No website selected</span>
+      <div><button id="allow-site" type="button">Allow</button><button id="block-site" type="button" class="danger">Block</button></div>
+    </div>
+  </main>
+  <footer>Local settings · no analytics · no remote code</footer>
+  <script src="popup.js"></script>
+</body>
+</html>

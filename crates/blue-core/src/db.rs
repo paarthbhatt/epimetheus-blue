@@ -1,6 +1,6 @@
 //! SQLite state. One writer, WAL, no ORM.
 
-use crate::model::{Artifact, DetectorResult, Event, Quarantined, Tier};
+use crate::model::{Artifact, Counts, Dataset, DetectorResult, Event, Finding, Quarantined, Tier};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -61,6 +61,28 @@ CREATE TABLE IF NOT EXISTS quarantine (
   restored_ms     INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS findings (
+  id              INTEGER PRIMARY KEY,
+  ts_ms           INTEGER NOT NULL,
+  kind            TEXT NOT NULL,
+  tier            INTEGER NOT NULL,
+  subject         TEXT NOT NULL,
+  detail          TEXT NOT NULL,
+  acknowledged_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_findings_ts ON findings(ts_ms DESC);
+
+CREATE TABLE IF NOT EXISTS datasets (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT NOT NULL,
+  version      TEXT NOT NULL,
+  source_url   TEXT,
+  sha256       TEXT,
+  size         INTEGER,
+  activated_ms INTEGER NOT NULL,
+  active       INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -92,13 +114,18 @@ impl Db {
     }
 
     fn init(&self) -> Result<()> {
-        let c = self.conn.lock().unwrap();
+        let c = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         c.execute_batch(SCHEMA)?;
         Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap()
+        self.conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Upsert an observation and return the artifact id.
@@ -341,6 +368,128 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn add_finding(
+        &self,
+        kind: &str,
+        tier: Tier,
+        subject: &str,
+        detail: &str,
+        now_ms: i64,
+    ) -> Result<i64> {
+        let c = self.lock();
+        c.execute(
+            "INSERT INTO findings (ts_ms, kind, tier, subject, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now_ms, kind, tier.as_i64(), subject, detail],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn list_findings(&self, limit: usize, include_acknowledged: bool) -> Result<Vec<Finding>> {
+        let c = self.lock();
+        let sql = if include_acknowledged {
+            "SELECT id, ts_ms, kind, tier, subject, detail, acknowledged_ms
+             FROM findings ORDER BY id DESC LIMIT ?1"
+        } else {
+            "SELECT id, ts_ms, kind, tier, subject, detail, acknowledged_ms
+             FROM findings WHERE acknowledged_ms IS NULL ORDER BY id DESC LIMIT ?1"
+        };
+        let mut stmt = c.prepare(sql)?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(Finding {
+                id: row.get(0)?,
+                ts_ms: row.get(1)?,
+                kind: row.get(2)?,
+                tier: Tier::from_i64(row.get(3)?),
+                subject: row.get(4)?,
+                detail: row.get(5)?,
+                acknowledged_at_ms: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn acknowledge_finding(&self, id: i64, now_ms: i64) -> Result<()> {
+        let c = self.lock();
+        c.execute(
+            "UPDATE findings SET acknowledged_ms = ?1 WHERE id = ?2",
+            params![now_ms, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_dataset(
+        &self,
+        name: &str,
+        version: &str,
+        source_url: Option<&str>,
+        sha256: &str,
+        size: i64,
+        now_ms: i64,
+    ) -> Result<i64> {
+        let mut c = self.lock();
+        let tx = c.transaction()?;
+        tx.execute(
+            "UPDATE datasets SET active = 0 WHERE name = ?1",
+            params![name],
+        )?;
+        tx.execute(
+            "INSERT INTO datasets (name, version, source_url, sha256, size, activated_ms, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+            params![name, version, source_url, sha256, size, now_ms],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn list_datasets(&self) -> Result<Vec<Dataset>> {
+        let c = self.lock();
+        let mut stmt = c.prepare(
+            "SELECT id, name, version, source_url, sha256, size, activated_ms, active
+             FROM datasets ORDER BY id DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Dataset {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                version: row.get(2)?,
+                source_url: row.get(3)?,
+                sha256: row.get(4)?,
+                size: row.get(5)?,
+                activated_at_ms: row.get(6)?,
+                active: row.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Cheap counters for the UI. One lock, four queries.
+    pub fn counts(&self) -> Result<Counts> {
+        let c = self.lock();
+        let artifacts: i64 = c.query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))?;
+        let quarantined: i64 = c.query_row(
+            "SELECT COUNT(*) FROM quarantine WHERE restored_ms IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let findings: i64 = c.query_row(
+            "SELECT COUNT(*) FROM findings WHERE acknowledged_ms IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let blocked: i64 = c.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'dns' AND level = 'notice'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(Counts {
+            artifacts,
+            quarantined,
+            findings,
+            blocked,
+        })
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {

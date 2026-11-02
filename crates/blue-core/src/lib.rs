@@ -1,7 +1,7 @@
 //! `blue-core` — shared vocabulary, state, policy and the quarantine store.
 //!
 //! Everything a component needs to agree on lives here. Detection lives in
-//! `blue-scan`, resolution in `blue-dns`, exposure in `blue-http`.
+//! `blue-scan`, resolution in `blue-dns`, exposure in the native `blue-ui`.
 
 pub mod config;
 pub mod db;
@@ -11,7 +11,10 @@ pub mod verdict;
 
 pub use config::Config;
 pub use db::Db;
-pub use model::{Artifact, Confidence, Detector, DetectorResult, Event, Quarantined, Tier};
+pub use model::{
+    Artifact, Confidence, Counts, Dataset, Detector, DetectorResult, Event, Finding, Quarantined,
+    Tier,
+};
 pub use quarantine::{Quarantine, StoredItem};
 pub use verdict::{classify, escalate_if_confirmed, reason};
 

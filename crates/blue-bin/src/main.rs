@@ -29,8 +29,9 @@ struct Cli {
     /// Override the state directory (useful for tests and drills).
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
+    /// With no subcommand, open the native desktop control center.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -39,12 +40,16 @@ enum Cmd {
     Scan(ScanArgs),
     /// Watch configured roots and scan files as they appear.
     Watch,
-    /// Run the local dashboard and JSON API.
-    Daemon,
+    /// Open the native desktop control center.
+    App,
     /// Run the DNS sinkhole resolver.
     Dns,
     /// Quarantine maintenance.
     Quarantine(QArgs),
+    /// Run the integrity and persistence check once.
+    Guard,
+    /// Filter feed maintenance.
+    Feeds(FeedArgs),
     /// Prove the pipeline works end to end with the EICAR string.
     Drill,
     /// Check configuration, state, rules and detectors.
@@ -77,6 +82,22 @@ enum QCmd {
     Restore { id: i64 },
 }
 
+#[derive(Args)]
+struct FeedArgs {
+    #[command(subcommand)]
+    cmd: FeedCmd,
+}
+
+#[derive(Subcommand)]
+enum FeedCmd {
+    /// Download, validate and atomically activate configured filter lists.
+    Sync,
+    /// Show locally installed lists.
+    Ls,
+    /// Restore the previous version of one list.
+    Rollback { name: String },
+}
+
 struct Ctx {
     cfg: Config,
     db: Arc<Db>,
@@ -92,17 +113,19 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing("info");
     let ctx = Ctx::open(cli.config.as_deref(), cli.state_dir)?;
+    init_tracing(&ctx.cfg.general.log_level);
 
     match cli.cmd {
-        Cmd::Scan(a) => cmd_scan(&ctx, a),
-        Cmd::Watch => cmd_watch(ctx),
-        Cmd::Daemon => cmd_daemon(ctx),
-        Cmd::Dns => cmd_dns(ctx),
-        Cmd::Quarantine(q) => cmd_quarantine(&ctx, q),
-        Cmd::Drill => cmd_drill(&ctx),
-        Cmd::Verify => cmd_verify(&ctx),
+        None | Some(Cmd::App) => cmd_app(ctx),
+        Some(Cmd::Scan(a)) => cmd_scan(&ctx, a),
+        Some(Cmd::Watch) => cmd_watch(ctx),
+        Some(Cmd::Dns) => cmd_dns(ctx),
+        Some(Cmd::Quarantine(q)) => cmd_quarantine(&ctx, q),
+        Some(Cmd::Guard) => cmd_guard(&ctx),
+        Some(Cmd::Feeds(args)) => cmd_feeds(&ctx, args),
+        Some(Cmd::Drill) => cmd_drill(&ctx),
+        Some(Cmd::Verify) => cmd_verify(&ctx),
     }
 }
 
@@ -198,34 +221,30 @@ fn cmd_watch(ctx: Ctx) -> Result<()> {
             eprintln!("warning: degraded — {reason}");
         }
         let (tx, rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                let _ = tx.send(true);
-            }
-        });
         let roots = ctx.cfg.roots();
         println!("watching {} root(s) — ctrl-c to stop", roots.len());
-        blue_scan::watch(engine, roots, ctx.cfg.scan.debounce_ms, rx)
+        blue_scan::watch(engine, roots, ctx.cfg.scan.debounce_ms, rx)?;
+        tokio::signal::ctrl_c().await?;
+        let _ = tx.send(true);
+        // Give the blocking watcher thread one tick to observe shutdown.
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        Ok(())
     })
 }
 
-fn cmd_daemon(ctx: Ctx) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let state = blue_http::AppState {
-        db: ctx.db.clone(),
-        quarantine: ctx.quarantine.clone(),
-        token: ctx.cfg.http.token.clone(),
-    };
-    let bind = ctx.cfg.http.bind.clone();
-    println!("dashboard on http://{bind}");
-    rt.block_on(blue_http::serve(state, &bind))
+fn cmd_app(ctx: Ctx) -> Result<()> {
+    blue_ui::run(blue_ui::AppDeps {
+        config: ctx.cfg,
+        db: ctx.db,
+        quarantine: ctx.quarantine,
+    })
 }
 
 fn cmd_dns(ctx: Ctx) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let mut list = blue_dns::Blocklist::new();
-        let dir = blue_core::config::expand_tilde(&ctx.cfg.dns.lists_dir);
+        let dir = blue_core::config::expand_tilde(&ctx.cfg.feeds.lists_dir);
         if dir.exists() {
             let n = list.load_dir(&dir)?;
             println!("loaded {n} list entries from {}", dir.display());
@@ -284,6 +303,73 @@ fn cmd_quarantine(ctx: &Ctx, q: QArgs) -> Result<()> {
         QCmd::Restore { id } => {
             let path = ctx.quarantine.restore(id)?;
             println!("restored {} -> {}", id, path.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_guard(ctx: &Ctx) -> Result<()> {
+    let guard = blue_guard::Guard::new(
+        ctx.db.clone(),
+        blue_guard::GuardConfig::from_config(&ctx.cfg),
+    );
+    let report = guard.run_once()?;
+    if report.baseline {
+        println!(
+            "baseline established: {} entries (this is not a clean bill of health)",
+            report.entries
+        );
+    } else {
+        println!(
+            "integrity check: {} entries, {} added, {} modified, {} removed, {} finding(s)",
+            report.entries, report.added, report.modified, report.removed, report.findings
+        );
+    }
+    Ok(())
+}
+
+fn cmd_feeds(ctx: &Ctx, args: FeedArgs) -> Result<()> {
+    let feeds = blue_feeds::Feeds::new(
+        ctx.db.clone(),
+        blue_feeds::FeedsConfig::from_config(&ctx.cfg),
+    );
+    match args.cmd {
+        FeedCmd::Sync => {
+            let report = feeds.sync()?;
+            for name in &report.updated {
+                println!("updated {name}");
+            }
+            for (name, reason) in &report.failed {
+                eprintln!("failed {name}: {reason}");
+            }
+            println!(
+                "{} list(s) updated, {} failed, {} usable lines",
+                report.updated.len(),
+                report.failed.len(),
+                report.total_lines
+            );
+            if !report.failed.is_empty() && report.updated.is_empty() {
+                bail!("no filter source updated successfully");
+            }
+        }
+        FeedCmd::Ls => {
+            let lists = feeds.list()?;
+            if lists.is_empty() {
+                println!("no local filter lists");
+            }
+            for list in lists {
+                println!(
+                    "{:<24} {:>9} lines  {:>8} KiB  {}",
+                    list.name,
+                    list.lines,
+                    list.bytes / 1024,
+                    list.path.display()
+                );
+            }
+        }
+        FeedCmd::Rollback { name } => {
+            feeds.rollback(&name)?;
+            println!("rolled {name} back to the previous version");
         }
     }
     Ok(())
@@ -362,7 +448,7 @@ fn cmd_verify(ctx: &Ctx) -> Result<()> {
         }
     }
 
-    let lists = blue_core::config::expand_tilde(&ctx.cfg.dns.lists_dir);
+    let lists = blue_core::config::expand_tilde(&ctx.cfg.feeds.lists_dir);
     if lists.exists() {
         let mut b = blue_dns::Blocklist::new();
         let n = b.load_dir(&lists)?;

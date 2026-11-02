@@ -13,7 +13,9 @@ path = "src/main.rs"
 blue-core.workspace = true
 blue-scan = { path = "../blue-scan" }
 blue-dns = { path = "../blue-dns" }
-blue-http = { path = "../blue-http" }
+blue-guard = { path = "../blue-guard" }
+blue-feeds = { path = "../blue-feeds" }
+blue-ui = { path = "../blue-ui" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true

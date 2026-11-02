@@ -13,4 +13,4 @@ pub mod blocklist;
 pub mod server;
 
 pub use blocklist::Blocklist;
-pub use server::{run, BlockResponse, DnsConfig, DnsStats};
+pub use server::{run, run_with_stats, BlockResponse, DnsConfig, DnsStats};

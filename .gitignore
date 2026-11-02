@@ -3,3 +3,4 @@
 *.db
 *.db-wal
 *.db-shm
+browser-extension/_metadata/

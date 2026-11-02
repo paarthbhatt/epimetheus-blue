@@ -1,0 +1,17 @@
+[package]
+name = "blue-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blue-core.workspace = true
+blue-scan = { path = "../blue-scan" }
+blue-guard = { path = "../blue-guard" }
+blue-feeds = { path = "../blue-feeds" }
+blue-dns = { path = "../blue-dns" }
+anyhow.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "system_fonts"] }
+tokio.workspace = true
+walkdir = "2"

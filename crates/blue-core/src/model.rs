@@ -145,3 +145,36 @@ pub struct Event {
     pub subject: Option<String>,
     pub payload: String,
 }
+
+/// An integrity or persistence observation. Not a virus, but often the thing
+/// that matters more: something changed the machine's startup path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Finding {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub kind: String,
+    pub tier: Tier,
+    pub subject: String,
+    pub detail: String,
+    pub acknowledged_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dataset {
+    pub id: i64,
+    pub name: String,
+    pub version: String,
+    pub source_url: Option<String>,
+    pub sha256: Option<String>,
+    pub size: Option<i64>,
+    pub activated_at_ms: i64,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Counts {
+    pub artifacts: i64,
+    pub quarantined: i64,
+    pub findings: i64,
+    pub blocked: i64,
+}

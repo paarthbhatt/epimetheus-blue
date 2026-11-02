@@ -88,6 +88,17 @@ pub async fn run(
     blocklist: Arc<Blocklist>,
     stop: watch::Receiver<bool>,
 ) -> Result<()> {
+    run_with_stats(cfg, blocklist, Arc::new(DnsStats::default()), stop).await
+}
+
+/// Run with caller-owned counters. Native control surfaces use this to show
+/// live totals without an HTTP side channel.
+pub async fn run_with_stats(
+    cfg: DnsConfig,
+    blocklist: Arc<Blocklist>,
+    stats: Arc<DnsStats>,
+    stop: watch::Receiver<bool>,
+) -> Result<()> {
     let DnsConfig {
         bind,
         upstreams,
@@ -96,7 +107,6 @@ pub async fn run(
     let socket = UdpSocket::bind(bind)
         .await
         .with_context(|| format!("binding DNS socket on {bind}"))?;
-    let stats = Arc::new(DnsStats::default());
     serve(
         Arc::new(socket),
         upstreams,

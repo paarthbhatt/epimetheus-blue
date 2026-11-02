@@ -14,7 +14,7 @@ workstation (Ryoku / Hyprland), single user.
    knowledge.
 3. Remove advertising, tracking and known-malicious domains from the network path
    for every application on the box, without breaking TLS.
-4. Make all three share one state model, one dashboard, one update mechanism, and
+4. Make all three share one state model, one native control center, one update mechanism, and
    one honest severity vocabulary.
 5. Never lose data, never wedge the desktop, never lie about coverage.
 
@@ -95,20 +95,20 @@ One artifact, one database, several service modes.
 
 ### 3.1 Single binary, multiple roles
 
-Decision (**ADR-1**): ship **one** Rust binary, `blue`, which dispatches on a
-subcommand. The alternative — five separate binaries — multiplies packaging,
+Decision (**ADR-1**): ship **one** Rust binary, `blue`, which opens a native app
+by default and dispatches CLI subcommands. The alternative — separate binaries — multiplies packaging,
 version-skew and unit-file surface for no benefit at this scale.
 
 ```text
-blue daemon        # long-running: event bus, policy, HTTP API, embedded UI
-blue scanner       # long-running: file watcher + scan pipeline
+blue               # native Wayland/X11 security control center
+blue watch         # long-running: file watcher + scan pipeline
 blue dns           # long-running: local sinkhole resolver
 blue guard         # long-running: FIM + persistence audit
 blue feeds sync    # oneshot, timer-driven
 blue scan <path>   # ad-hoc scan
 blue quarantine {ls,show,restore,export}
 blue verify        # self-check: DB, feeds, detectors, units
-blue drill eicar   # end-to-end detection self-test
+blue drill         # end-to-end EICAR detection self-test
 ```
 
 ### 3.2 Crate layout
@@ -120,13 +120,12 @@ blue/
 │   ├── blue-bin/               # clap dispatch, service wiring, signal handling
 │   ├── blue-core/              # config, sqlite, events, verdict policy, quarantine
 │   ├── blue-scan/              # inotify watcher, clamd client, yara-x engine, queue
-│   ├── blue-dns/               # hickory resolver, blocklist compiler, matcher
+│   ├── blue-dns/               # UDP resolver, blocklist parser, suffix matcher
 │   ├── blue-guard/             # hashing, FIM, persistence inventory, pacman drift
 │   ├── blue-feeds/             # fetch, verify, activate, rollback datasets
-│   └── blue-http/              # axum router, SSE stream, rust-embed UI assets
-├── assets/                     # dashboard (vanilla HTML/JS, no build step)
-├── config/                     # default TOML, example overrides
-├── packaging/                  # PKGBUILD, systemd units, sysusers, tmpfiles
+│   └── blue-ui/                # native eframe/egui Wayland/X11 application
+├── browser-extension/          # Chromium/Brave MV3 search companion
+├── packaging/                  # desktop entry and systemd user units
 └── docs/
 ```
 
@@ -134,11 +133,11 @@ blue/
 
 | Service | User | Privileges | Rationale |
 |---|---|---|---|
-| `blue-daemon` | `blue` (system user) | none beyond its own state dir | Owns DB and API; reachable only on loopback |
-| `blue-scanner` | `blue-scanner` (system user), member of `blue` group | `CAP_DAC_READ_SEARCH` **optional**, only if system paths are watched | Reads user files to scan them; never writes outside quarantine |
-| `blue-dns` | `blue-dns` | bind 127.0.0.1:53 only | No root after bind if port 53 is granted via capability |
-| `blue-guard` | `blue-guard` | read access to startup paths | Read-only by design |
-| `blue-feeds` | `blue` | network egress only | Downloads and verifies datasets |
+| native app | logged-in user | normal user access | Controls scanning, guard, feeds and quarantine directly; no HTTP listener |
+| `blue-watch.service` | logged-in user | normal user read access | Reads configured user paths; quarantine is its only data-moving operation |
+| `blue-dns` | logged-in user | port 53 requires one-time external capability/setup | Resolver is never silently privileged by the installer |
+| `blue-guard.timer` | logged-in user | read access to configured startup paths | Read-only by design |
+| `blue-feeds.timer` | logged-in user | network egress | Downloads and validates DNS datasets |
 
 **No service runs as root.** Where root would normally be required:
 
@@ -170,7 +169,7 @@ queue (bounded, 10k, disk-backed spool for overflow)
  verdict policy (§6)  → tier T0..T3
    ▼
  T0/T1: review queue, no action
- T2/T3: quarantine + notify + dashboard entry
+ T2/T3: quarantine + native-app entry
    ▼
  event row + evidence row (matched bytes, detector, timestamps, file hash)
 ```
@@ -178,19 +177,17 @@ queue (bounded, 10k, disk-backed spool for overflow)
 ### 3.5 Data flow — DNS query
 
 ```text
-app → 127.0.0.1:53
+app → configured loopback UDP port
    │
-   ├─ cache hit (LRU, 4096 entries, TTL-aware)
-   ├─ blocklist match (suffix trie / FST set)
+   ├─ blocklist match (reversed-label map)
    │     → NXDOMAIN or 0.0.0.0 per policy, log {client, qname, list, action}
-   └─ miss → forward over DoT to configured upstream
-                → cache, log latency/outcome
+   └─ miss → forward over UDP to a configured upstream (2 s timeout)
 ```
 
 Blocklist matching is **suffix-based**: `ads.example.com` blocks
 `x.ads.example.com` but not `example.com`. Allowlist always wins over blocklist.
-Per-list attribution is stored so the dashboard can answer *which list* blocked
-something, not just that something was blocked.
+The matcher retains first-list-wins attribution for diagnostics. The current UI
+shows aggregate live counts; a per-list query ledger is future work.
 
 ### 3.6 Data flow — integrity and persistence
 
@@ -216,80 +213,69 @@ on a developer workstation ("something added a systemd user unit I did not write
 - Config: layered TOML — `/etc/blue/config.toml`, `~/.config/blue/config.toml`,
   CLI overrides. Unknown keys are a hard error (no silent typos).
 - State: SQLite via `rusqlite` (bundled), WAL mode, single writer.
-- Event bus: in-process `tokio::broadcast`; persistence is the durable path.
+- State communication: direct shared handles inside the native process; SQLite is the durable path.
 - Verdict policy: pure function over `(detector results, context) → Tier`.
   Unit-testable, no I/O. This is the most important 200 lines in the project.
-- Quarantine: content-addressed store, `objects/<sha256>`, manifests in DB, a
-  `chmod 000` copy under `links/`. Restore replays metadata.
+- Quarantine: one retained object per event at `items/<id>/payload`, mode `000`,
+  with original path/mode and hash recorded. Restore refuses to overwrite.
 - Kill switch: one atomic flag in the DB and a file; all responders check it
   before acting.
 
 ### 4.2 `blue-scan`
 
-- Watcher: `notify` crate over inotify. Recursive watches only on configured
-  roots (`~/Downloads`, `~/Documents`, `~/tmp`, `/tmp`, `~/Projects`), capped at
-  `max_user_watches`; refuses to start with a clear message if the cap is too low
-  and prints the exact `sysctl` to set.
-- Concurrency: 4 scan workers by default, bounded channel, per-file timeout
-  (30 s), total scan budget per batch.
-- ClamAV: persistent `clamd` over Unix socket via the clamd protocol
-  (`INSTREAM`, `clamav-client` crate), *not* spawning `clamscan` per file —
+- Watcher: `notify` over inotify, recursive only on configured roots, with
+  per-path debounce and self-generated access events ignored.
+- Scan path is synchronous and deliberately small; the native app moves full
+  directory scans to a worker thread so the UI stays responsive.
+- ClamAV: `clamd` over a Unix socket via the `INSTREAM` protocol,
+  *not* spawning `clamscan` per file —
   process startup would dominate.
 - YARA: `yara-x` (pure-Rust YARA, verified available at 1.22.x) compiled rules
   loaded once, hot-reloaded on dataset activation, scan with a scan timeout and
   `max_rule_scan` guard.
-- Prefilter: size cap (default 512 MiB), extension allow/deny lists, ELF/PE/script
-  sniffing, skip if the hash is in the known-clean cache and the file is unchanged.
-- Backpressure: when the queue exceeds 80 %, emit a `SCANNER_OVERLOADED` event and
-  degrade to scheduled-only scanning rather than dropping silently.
+- Prefilter: exclusion globs and a 512 MiB default size cap. Oversized files are
+  skipped without spending the same I/O budget hashing them first.
 
 ### 4.3 `blue-dns`
 
-- Resolver: `hickory-server` with a custom authority that consults the blocklist
-  before forwarding.
-- Blocklist compile: fetch plain-text hosts/domain lists → normalize → dedupe →
-  build a suffix matcher. Target: 500k domains in under 2 s, under 150 MB RSS,
-  p99 lookup under 1 ms. If those numbers miss, fall back to a sorted-array
-  binary search before considering anything exotic.
-- Upstreams: DoT by default (Cloudflare/Quad9), configurable; never plaintext
-  unless explicitly set.
-- Conflict handling: on startup, if `:53` is bound, refuse and print who holds it
-  (`ss -lunp`). Do not fight `systemd-resolved`; document the exact disable steps.
-- Client identification: per-source-IP counters, later per-interface names, so LAN
-  promotion is a config change rather than a rewrite.
+- Resolver: a small Tokio UDP sinkhole/forwarder. It parses only the first DNS
+  question and never panics on malformed datagrams.
+- Blocklists accept hosts, bare-domain and common Adblock anchor formats, then use
+  exact label-boundary suffix matching. Allowlists always win.
+- Upstreams are UDP in this build. DoT remains a future seam, not a current claim.
+- Bind conflicts and permission errors are returned visibly to the native app.
 
 ### 4.4 `blue-guard`
 
-- FIM: BLAKE3 hashes, snapshot table, diff, classification.
+- FIM: SHA-256 hashes in a bounded JSON inventory persisted in SQLite meta state.
 - Persistence inventory: systemd user+system units, drop-ins, timers, cron/at,
   XDG autostart, `~/.config/hypr` exec lines, shell rc, `~/.ssh/authorized_keys`,
   `/etc/ld.so.preload`, `/etc/pacman.conf` hooks, browser native-messaging hosts.
-- Package drift: compare `pacman -Qkk` output and file ownership against the last
-  known-good snapshot; flag files owned by a package but modified, and files in
-  system paths owned by no package.
+- Package drift: run bounded `pacman -Qkk` directly (never through a shell), parse
+  warnings/altered summaries, and degrade visibly on timeout or command failure.
 - Baseline discipline: the first run creates a baseline and says so. It does not
   claim the machine is clean — it claims the machine is *known*.
 
 ### 4.5 `blue-feeds`
 
-- Sources: `freshclam` for ClamAV; project-pinned YARA rule sets; DNS blocklists
-  (ads, trackers, malware C2) from public providers.
-- Pipeline: `fetch → hash → verify → stage → compile → activate → record`.
+- Sources: configured plain-text DNS hosts/domain blocklists. ClamAV keeps using
+  its own `freshclam`; Blue does not impersonate that updater.
+- Pipeline: `fetch → size-limit → structural validation → hash → stage → activate → record`.
 - Every activation writes a dataset row (source, version, hash, size, timestamp).
 - Rollback: `blue feeds rollback <dataset>` reactivates the previous row. A bad
   blocklist that breaks the internet must be a 5-second fix.
 - No dataset is vendored in git. Licenses differ per list; each source entry
   records its license and fetch URL.
 
-### 4.6 `blue-http`
+### 4.6 `blue-ui` and browser companion
 
-- `axum`, bound to `127.0.0.1:8471` only, bearer token from a root-owned file.
-- Endpoints: `/api/events`, `/api/verdicts`, `/api/quarantine`,
-  `/api/dns/stats`, `/api/integrity`, `/api/feeds`, `/api/health`,
-  `/api/killswitch`, plus an SSE stream for the dashboard.
-- UI: embedded static assets, no Node toolchain, no CDN. Works offline.
-- Read-only by default; the few mutating verbs (`restore`, `killswitch`,
-  `feeds rollback`) require a confirmation token minted per-session.
+- `eframe`/`egui` renders a native Wayland/X11 window. It contains no web view,
+  web server, or loopback HTTP API.
+- Long-running work executes off the UI thread. State is refreshed from SQLite;
+  mutating verbs call the same Rust policy/quarantine APIs as the CLI.
+- The Chromium/Brave Manifest V3 companion is deliberately separate. It removes
+  sponsored search cards, strips tracking parameters, provides safe-search
+  shortcuts and applies conservative DNR domain rules. It loads no remote code.
 
 ---
 
@@ -418,13 +404,12 @@ Rules:
 
 | Failure | Behaviour | Why |
 |---|---|---|
-| `clamd` unavailable | Scanner enters `DEGRADED`, YARA-only scanning continues, dashboard shows the state | Partial coverage beats blocked files and an uninstalled tool |
+| `clamd` unavailable | Scanner enters `DEGRADED`, YARA-only scanning continues, native app shows the state | Partial coverage beats blocked files and an uninstalled tool |
 | YARA rules fail to compile | Activate previous dataset automatically, keep the failure visible | A broken rule set must not take the pipeline down |
-| Queue overflows | Coalesce, drop oldest low-priority work, emit `SCANNER_OVERLOADED` | Silent loss is the thing we must not do |
 | Blocklist breaks a site | Allowlist entry, one-command rollback to previous dataset | The resolver is on the critical path of everything |
-| Port 53 taken | Refuse to start, name the holder, print remediation | Never race another resolver |
-| DB locked / corrupt | Read-only mode, UI shows the error, scanner spools to disk | Lose diagnosis, not events |
-| Kill switch engaged | All responders stop within one event-loop tick; watchers keep observing | A one-action panic button |
+| Port 53 taken or denied | Refuse cleanly and show the bind error | Never race another resolver or hide missing privilege |
+| DB locked / corrupt | Operation fails visibly in the UI; no clean claim is shown | Silent loss is worse than an explicit failed operation |
+| Kill switch engaged | Scans and evidence continue; quarantine is suppressed | A reversible automatic-action pause |
 | Disk full | Quarantine refuses new objects, emits error, never partial-copies | A truncated quarantine object is worse than none |
 
 **Fail-open principle:** the scanner never blocks a file open. fanotify
@@ -442,15 +427,14 @@ Measured on this machine (16 threads, 15 GiB).
 | Idle RSS, all services | < 120 MiB total |
 | RSS during full scan | < 400 MiB |
 | Blocklist memory @ 500k domains | < 150 MiB |
-| DNS lookup p99, cache miss | < 2 ms added latency |
-| DNS lookup p99, cache hit | < 0.2 ms |
+| DNS blocklist lookup p99 | < 1 ms |
 | Time from `CLOSE_WRITE` to verdict (1 MiB file) | < 1 s |
 | Full scan of `~/Downloads` (10 GiB) | < 10 min |
 | Boot impact | services start concurrently, do not block login |
 | CPU when idle | < 1 % average |
 
-Budgets are enforced by a `blue bench` command so regressions are visible, not
-discovered.
+These remain budgets, not yet automated release gates. Functional tests are the
+current release gate; benchmark automation is future work.
 
 ---
 
@@ -458,15 +442,13 @@ discovered.
 
 ```toml
 [general]
-state_dir = "/var/lib/blue"
-kill_switch = false
+state_dir = "~/.local/share/blue"
 log_level = "info"
 
 [scan]
 roots = ["~/Downloads", "~/Documents", "~/Projects", "~/tmp", "/tmp"]
 exclude_globs = ["**/node_modules/**", "**/.git/objects/**", "**/*.iso"]
 max_file_size_mb = 512
-workers = 4
 debounce_ms = 500
 # fanotify is documented but disabled: it needs CAP_SYS_ADMIN and can block opens.
 mode = "inotify"
@@ -476,22 +458,23 @@ socket = "/run/clamav/clamd.ctl"
 required = false          # degrade rather than fail closed
 
 [scan.yara]
-rule_sets = ["core", "webshells", "ransomware"]
+rule_dirs = ["~/.local/share/blue/rules"]
 timeout_ms = 5000
-
-[verdict]
-quarantine_at = "T2"      # or "T3" for a more conservative posture
-notify_at = "T2"
 
 [dns]
 bind = "127.0.0.1:53"
-upstreams = ["tls://1.1.1.1:853", "tls://9.9.9.9:853"]
+upstreams = ["1.1.1.1:53", "9.9.9.9:53"]
 block_response = "nxdomain"   # or "zero"
-lists = ["ads", "trackers", "malware"]
-allowlist = ["*.local", "*.internal", "github.com"]
+
+[feeds]
+lists_dir = "~/.local/share/blue/lists"
+
+[[feeds.sources]]
+name = "stevenblack"
+url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+license = "MIT"
 
 [guard]
-interval_minutes = 15
 watch_paths = [
   "~/.config/systemd/user",
   "~/.config/autostart",
@@ -499,10 +482,9 @@ watch_paths = [
   "/etc/ld.so.preload",
   "/etc/systemd/system",
 ]
-watch_packages = true
+# Full pacman -Qkk is resource-heavy; enable only for explicit/manual audits.
+watch_packages = false
 
-[http]
-bind = "127.0.0.1:8471"
 ```
 
 ---
@@ -512,11 +494,9 @@ bind = "127.0.0.1:8471"
 ### Units
 
 ```text
-blue-daemon.service      After=network.target
-blue-scanner.service     After=blue-daemon.service clamav-daemon.service
-blue-dns.service         After=blue-daemon.service, Wants=network-online.target
-blue-guard.service       After=blue-daemon.service
-blue-feeds.timer         hourly; oneshot service
+blue-watch.service       optional always-on realtime watcher
+blue-guard.timer         15-minute read-only integrity check
+blue-feeds.timer         daily filter update with randomized delay
 ```
 
 All units:
@@ -525,7 +505,6 @@ All units:
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
@@ -534,31 +513,31 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-SystemCallFilter=@system-service
-MemoryMax=300M
+MemoryMax=512M
 TasksMax=64
 ```
 
-Acceptance: `systemd-analyze security` score below 2.0 exposure for each unit.
+Units are installed but not enabled automatically. The native app or an explicit
+`systemctl --user enable --now ...` controls them.
 
 ### Packaging
 
-`PKGBUILD` + `sysusers.d` + `tmpfiles.d`. ClamAV and `clamav-daemon` remain distro
-packages; we depend on them rather than vendoring. `freshclam` stays the system
-updater; `blue-feeds` orchestrates and records it, it does not replace it.
+`scripts/install-local.sh` installs the native binary, desktop entry, browser
+extension and systemd user units without root. A distro `PKGBUILD` is future work.
+ClamAV remains a distro package and `freshclam` remains its own updater.
 
 ### Bootstrap order
 
 ```bash
-pacman -S clamav yara   # or rely on yara-x, see ADR-3
+pacman -S clamav        # YARA-X is embedded, see ADR-3
 systemctl enable --now clamav-daemon clamav-freshclam
 blue verify             # DB, units, feeds, detectors
 blue feeds sync
-blue drill eicar        # end-to-end proof the pipeline works
+blue drill              # end-to-end proof the pipeline works
 blue scan ~/Downloads
 ```
 
-`blue drill eicar` writes the EICAR test string to a temp watched path, waits for
+`blue drill` writes the EICAR test string to a controlled state path, waits for
 the verdict, asserts T2, quarantines it, restores it, and deletes it. This is the
 single most important command in the suite: it proves the wiring without touching
 a real sample.
@@ -573,10 +552,11 @@ a real sample.
 | ADR-2 | inotify by default, fanotify documented but off | fanotify — needs `CAP_SYS_ADMIN`, permission events block opens |
 | ADR-3 | `yara-x` embedded engine, not the `yara` CLI | shelling out per file — process spawn dominates scan time |
 | ADR-4 | `clamd` over Unix socket, not `clamscan` per file | per-file process — same reason |
-| ADR-5 | hickory-based resolver, not Unbound/Blocky | external daemon — loses per-list attribution and unified state |
+| ADR-5 | Minimal Tokio UDP resolver, not Unbound/Blocky | external daemon — loses in-process controls; full DNS stack is YAGNI for a sinkhole |
 | ADR-6 | Quarantine only, delete never | auto-delete — irreversible, and the usual cause of data loss |
 | ADR-7 | DNS sinkhole, no TLS interception | MITM proxy — breaks cert validation, bigger attack surface |
-| ADR-8 | Loopback HTTP + bearer token, no auth stack | full auth — single-user box, not worth the surface |
+| ADR-8 | Native eframe/egui app, no loopback HTTP | web dashboard/Electron — unnecessary listener/runtime for one local user |
+| ADR-9 | Separate MV3 browser companion | TLS MITM or all-page DOM inspection — excessive privilege and breakage |
 
 ---
 
@@ -584,11 +564,12 @@ a real sample.
 
 | Phase | Deliverable | Acceptance |
 |---|---|---|
-| 0 | `blue-core` skeleton, config, SQLite, `blue scan`, `blue drill eicar` | EICAR detected, quarantined, restored; zero root daemons |
-| 1 | `blue-dns` with three lists, dashboard DNS tab | 500k domains compile < 2 s, p99 < 1 ms, rollback works |
-| 2 | `blue-scanner` watcher, `blue-guard` FIM + persistence | Write to `~/Downloads` → verdict < 1 s; injected systemd unit alert |
-| 3 | `blue-http` dashboard, notifications, `blue feeds` timer | One screen answers "what happened this week" |
-| 4 | Optional: hash-only VirusTotal, egress observer, browser companion | Opt-in, offline-safe, no file uploads by default |
+| 0 | `blue-core`, scanning, quarantine, EICAR drill | complete |
+| 1 | DNS suffix sinkhole and blocklist matcher | complete |
+| 2 | Watcher, integrity/persistence guard, package drift | complete |
+| 3 | Native control center, versioned feeds, systemd user timers | complete |
+| 4 | Chromium/Brave search companion | complete |
+| Future | DoT upstream, notifications, opt-in hash reputation | not claimed |
 
 Phase 0 is designed to be useful on day one and dangerous to nothing.
 
@@ -608,13 +589,12 @@ Each is a scripted, repeatable test. If a drill fails, the release is not done.
 5. **Resolver conflict** — occupy `:53`, start `blue dns`, assert clean refusal.
 6. **Blocklist rollback** — activate a broken list, rollback, assert resolution
    restored in under 5 s.
-7. **False-positive path** — dismiss a verdict with a reason, assert the hash is
-   allowlisted and a re-scan does not re-alert.
-8. **Persistence injection** — add a systemd user unit, assert a T1 persistence
+7. **Persistence injection** — add a systemd user unit, assert a T1 persistence
    event within one guard interval.
-9. **Restart resilience** — kill all services mid-scan, restart, assert no
+8. **Restart resilience** — kill all services mid-scan, restart, assert no
    duplicate quarantines and no lost events.
-10. **Hardening** — `systemd-analyze security` below threshold for every unit.
+9. **Extension validation** — manifest parses, scripts pass syntax checks, static
+   rule IDs are unique and Chromium accepts the unpacked extension.
 
 ---
 
@@ -650,18 +630,20 @@ Not "zero infections". Success is:
 
 ## 16. Implementation status
 
-Built and verified on 2026-11-02: 52 tests, `blue drill` passing end to end,
-dashboard and resolver smoke-tested live.
+Built on 2026-11-02. `blue drill` passes end to end; the resolver and browser
+extension have live smoke tests. The current workspace test count is recorded in
+the release summary rather than hard-coded here.
 
 | Component | State |
 |---|---|
 | `blue-core` (config, SQLite, verdict, quarantine) | implemented |
-| `blue-scan` (YARA-X, clamd, watcher, queue) | implemented |
+| `blue-scan` (YARA-X, clamd, watcher) | implemented |
 | `blue-dns` (suffix blocklist, UDP sinkhole/forwarder) | implemented |
-| `blue-http` (API, dashboard, kill switch) | implemented |
-| `blue-guard` (FIM, persistence audit) | not started |
-| `blue-feeds` (dataset sync, rollback) | not started |
-| systemd units, PKGBUILD | template unit only |
+| `blue-ui` (native Wayland/X11 app, kill switch) | implemented |
+| `blue-guard` (FIM, persistence audit, package drift) | implemented |
+| `blue-feeds` (validated dataset sync, rollback) | implemented |
+| Chromium/Brave MV3 search companion | implemented |
+| systemd user units + desktop entry | implemented |
 
 ### Deviations from the design above
 
@@ -675,12 +657,13 @@ These are deliberate and cheap to reverse. Listed so the doc does not drift.
    user and `/var/lib/blue`. Running unprivileged was the safer first step; the
    `blue@.service` template documents the hardened system install.
 3. **YARA-X is built with `default-features = false`.** The default feature set
-   pulls in the full module ecosystem (including a WebAssembly runtime) for rules
-   that only use plain strings. Re-enable module features when a dataset needs them.
+   pulls in parsers and modules that the current plain-string rules do not use.
+   YARA-X core still brings its own runtime; this switch trims optional modules,
+   not the entire dependency graph. Re-enable only what a future dataset needs.
 4. **DNS upstreams are plaintext UDP in this build.** DoT is the documented next
    step; the config already carries upstream addresses, so no API change.
-5. **`blue scan` has no `--json` yet.** It prints a table and a summary line; the
-   API serves JSON for programmatic use.
+5. **`blue scan` has no `--json` yet.** It prints a table and a summary line;
+   SQLite is the durable machine-readable state.
 6. **Oversized files are recorded as T0 with no hash and no row**, rather than
    hashing 512 MiB just to skip it. Visible in the per-file output.
 
@@ -691,4 +674,3 @@ These are deliberate and cheap to reverse. Listed so the doc does not drift.
 - Kill switch on: verdict recorded, nothing moved.
 - Restore refuses to overwrite a file that reappeared at the original path.
 - Stopping `clamd` degrades the scanner instead of failing closed.
-

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Epimetheus Blue
+GenericName=Device Security
+Comment=Personal malware, integrity, DNS and browser protection
+Exec=blue
+Icon=security-high
+Terminal=false
+Categories=System;Security;
+Keywords=antivirus;malware;security;ad blocker;privacy;
+StartupNotify=true
+StartupWMClass=epimetheus-blue
