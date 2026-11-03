@@ -585,11 +585,45 @@ impl Db {
     pub fn set_kill_switch(&self, on: bool) -> Result<()> {
         self.set_meta("kill_switch", if on { "1" } else { "0" })
     }
+
+    /// Shared nonblocking budget: at most one uncached VT lookup per 16 seconds.
+    pub fn reserve_virustotal_slot(&self, now: i64) -> Result<bool> {
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'vt:last-request-ms'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if previous
+            .and_then(|v| v.parse::<i64>().ok())
+            .is_some_and(|v| now.saturating_sub(v) < 16_000)
+        {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('vt:last-request-ms',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![now.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virustotal_budget_is_shared_and_nonblocking() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.reserve_virustotal_slot(100_000).unwrap());
+        assert!(!db.reserve_virustotal_slot(100_001).unwrap());
+        assert!(!db.reserve_virustotal_slot(115_999).unwrap());
+        assert!(db.reserve_virustotal_slot(116_000).unwrap());
+    }
 
     #[test]
     fn artifact_roundtrip() {

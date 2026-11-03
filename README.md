@@ -172,6 +172,13 @@ export VIRUSTOTAL_API_KEY='…'
 blue reputation check /path/to/file --online
 ```
 
+For desktop and background use, a user-owned mode-0600 credential file is also
+supported through `reputation.virustotal_api_key_file`. Store only the path in
+TOML, never the key. Environment credentials take precedence. Uncached lookups
+share a nonblocking 16-second request budget; local detection always continues.
+If automatic VT scans are enabled, the watcher needs outbound networking in a
+user-service override. This does not change NetworkManager or system DNS.
+
 ## Cleanup safety model
 
 The **Cleanup** tab never deletes during analysis and never selects an item for

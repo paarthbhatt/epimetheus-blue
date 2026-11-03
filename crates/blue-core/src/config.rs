@@ -52,6 +52,8 @@ pub struct Reputation {
     pub virustotal_enabled: bool,
     pub virustotal_query_on_scan: bool,
     pub virustotal_api_key_env: String,
+    /// Optional protected credential file; the API key is never stored in TOML.
+    pub virustotal_api_key_file: Option<String>,
     pub virustotal_min_malicious: u32,
     pub cache_hours: u64,
 }
@@ -68,6 +70,7 @@ impl Default for Reputation {
             virustotal_enabled: false,
             virustotal_query_on_scan: false,
             virustotal_api_key_env: "VIRUSTOTAL_API_KEY".into(),
+            virustotal_api_key_file: None,
             virustotal_min_malicious: 3,
             cache_hours: 168,
         }

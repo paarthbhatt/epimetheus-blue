@@ -1301,8 +1301,13 @@ impl BlueApp {
                 );
                 ui.label(
                     RichText::new(format!(
-                        "API key environment: {}",
-                        self.deps.config.reputation.virustotal_api_key_env
+                        "Credential: {}",
+                        self.deps
+                            .config
+                            .reputation
+                            .virustotal_api_key_file
+                            .as_deref()
+                            .unwrap_or(&self.deps.config.reputation.virustotal_api_key_env)
                     ))
                     .monospace()
                     .color(MUTED),

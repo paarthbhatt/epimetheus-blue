@@ -47,6 +47,7 @@ pub struct ReputationConfig {
     pub virustotal_query_on_scan: bool,
     /// Name of the environment variable holding the key, never the key itself.
     pub virustotal_api_key_env: String,
+    pub virustotal_api_key_file: Option<PathBuf>,
     pub virustotal_min_malicious: u32,
     pub cache_hours: u64,
 }
@@ -68,6 +69,11 @@ impl ReputationConfig {
             virustotal_enabled: config.reputation.virustotal_enabled,
             virustotal_query_on_scan: config.reputation.virustotal_query_on_scan,
             virustotal_api_key_env: config.reputation.virustotal_api_key_env.clone(),
+            virustotal_api_key_file: config
+                .reputation
+                .virustotal_api_key_file
+                .as_deref()
+                .map(blue_core::config::expand_tilde),
             virustotal_min_malicious: config.reputation.virustotal_min_malicious,
             cache_hours: config.reputation.cache_hours,
         }
@@ -130,7 +136,8 @@ impl ReputationEngine {
         let sha256 = canonical_sha256(sha256)?;
         let local_match = self.local_read().hashes.get(&sha256).cloned();
 
-        let virustotal = if online && self.cfg.virustotal_enabled {
+        // A known local IOC needs no network corroboration and survives outages.
+        let virustotal = if online && self.cfg.virustotal_enabled && local_match.is_none() {
             Some(self.check_virustotal(&sha256)?)
         } else {
             None
@@ -293,7 +300,13 @@ impl ReputationEngine {
             }
         }
 
-        let api_key = read_api_key(&self.cfg.virustotal_api_key_env)?;
+        let api_key = read_api_key(
+            &self.cfg.virustotal_api_key_env,
+            self.cfg.virustotal_api_key_file.as_deref(),
+        )?;
+        if !self.db.reserve_virustotal_slot(timestamp)? {
+            bail!("VirusTotal lookup deferred by the shared request budget; local detection remains available");
+        }
         let url = format!("https://www.virustotal.com/api/v3/files/{sha256}");
         let agent = ureq::AgentBuilder::new()
             .timeout(VIRUSTOTAL_TIMEOUT)
@@ -511,7 +524,10 @@ fn cache_is_fresh(record: &ReputationRecord, timestamp: i64, cache_hours: u64) -
     record.checked_at_ms >= timestamp.saturating_sub(ttl_ms)
 }
 
-fn read_api_key(environment_variable: &str) -> Result<String> {
+fn read_api_key(environment_variable: &str, credential_file: Option<&Path>) -> Result<String> {
+    if std::env::var_os(environment_variable).is_none() {
+        return read_protected_key(credential_file.context("VirusTotal key is not configured")?);
+    }
     let value = std::env::var_os(environment_variable).ok_or_else(|| {
         anyhow::anyhow!("VirusTotal API key environment variable {environment_variable} is not set")
     })?;
@@ -527,6 +543,37 @@ fn read_api_key(environment_variable: &str) -> Result<String> {
         bail!(
             "VirusTotal API key environment variable {environment_variable} contains invalid header characters"
         );
+    }
+    Ok(value)
+}
+
+fn validate_key_permissions(before: &std::fs::Metadata, after: &std::fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self")?.uid();
+    if after.uid() != uid || after.mode() & 0o077 != 0 {
+        bail!("VirusTotal credential must be user-owned with mode 0600");
+    }
+    if before.dev() != after.dev() || before.ino() != after.ino() {
+        bail!("VirusTotal credential changed while opening");
+    }
+    Ok(())
+}
+
+fn read_protected_key(path: &Path) -> Result<String> {
+    let before = std::fs::symlink_metadata(path).context("reading credential metadata")?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        bail!("VirusTotal credential must be a regular file, not a symlink");
+    }
+    let file = File::open(path).context("opening VirusTotal credential file")?;
+    validate_key_permissions(&before, &file.metadata()?)?;
+    let mut value = String::new();
+    file.take(4097).read_to_string(&mut value)?;
+    if value.len() > 4096 || value.trim().is_empty() {
+        bail!("VirusTotal credential is empty or oversized");
+    }
+    let value = value.trim().to_owned();
+    if !value.bytes().all(|b| b.is_ascii_graphic()) {
+        bail!("VirusTotal credential contains invalid header characters");
     }
     Ok(value)
 }
@@ -725,6 +772,21 @@ fn sync_directory(directory: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn protected_key_file_rejects_public_permissions_and_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "test-credential\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_protected_key(&path).unwrap(), "test-credential");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_protected_key(&path).is_err());
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_protected_key(&link).is_err());
+    }
+
     fn hash(number: u64) -> String {
         format!("{number:064x}")
     }
@@ -746,6 +808,7 @@ mod tests {
                 virustotal_enabled: enabled,
                 virustotal_query_on_scan: false,
                 virustotal_api_key_env: "BLUE_REPUTATION_TEST_MISSING_KEY".into(),
+                virustotal_api_key_file: None,
                 virustotal_min_malicious: 3,
                 cache_hours: 24,
             },
@@ -786,6 +849,7 @@ mod tests {
                 virustotal_enabled: false,
                 virustotal_query_on_scan: false,
                 virustotal_api_key_env: "UNUSED".into(),
+                virustotal_api_key_file: None,
                 virustotal_min_malicious: 3,
                 cache_hours: 24,
             },
@@ -814,7 +878,7 @@ mod tests {
 
     #[test]
     fn local_match_is_high_confidence_hash_reputation() {
-        let (_directory, _db, engine) = fixture(false);
+        let (_directory, _db, engine) = fixture(true);
         let target = hash(42);
         std::fs::write(
             engine.cfg.local_dir.join("local.sha256"),
@@ -823,7 +887,7 @@ mod tests {
         .unwrap();
         engine.reload_local().unwrap();
 
-        let result = engine.check_hash(&target, false).unwrap();
+        let result = engine.check_hash(&target, true).unwrap();
         assert_eq!(result.local_match.as_deref(), Some("local"));
         let detector = result.detector.unwrap();
         assert_eq!(detector.detector, Detector::HashRep);
@@ -900,6 +964,7 @@ mod tests {
                 virustotal_enabled: false,
                 virustotal_query_on_scan: false,
                 virustotal_api_key_env: "UNUSED".into(),
+                virustotal_api_key_file: None,
                 virustotal_min_malicious: 3,
                 cache_hours: 24,
             },
