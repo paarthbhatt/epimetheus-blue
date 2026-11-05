@@ -4,3 +4,9 @@
 *.db-wal
 *.db-shm
 browser-extension/_metadata/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials/

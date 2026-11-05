@@ -1,0 +1,3 @@
+# Verified DER PUBLIC key in Chromium manifest; pins the stable extension ID.
+# This exact historical finding is not an API credential or private key.
+3f03a50ba1173bbe3649890ceb1fcf028d2d2bc7:browser-extension/manifest.json:generic-api-key:6
