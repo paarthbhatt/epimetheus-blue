@@ -116,16 +116,14 @@ Keep a local recovery path when changing remote-access rules. Administrator
 prompt time is not an extension of the rollback window. If rollback or status
 reports an error, investigate it; do not assume connectivity or protection.
 
-## Optional boot persistence
+## Confirmed boot persistence
 
-First apply and confirm a policy. To opt in to restoring that confirmed policy
-on subsequent boots, separately authorize:
+Explicit confirmation durably saves the policy and enables the fixed
+`blue-firewall.service` for subsequent boots. It does not start or restart that
+service. If enablement fails, the helper reports the partial outcome and an
+explicit Confirm can retry it. Apply alone never enables boot persistence.
 
-```bash
-sudo systemctl enable blue-firewall.service
-```
-
-This example intentionally omits `--now`. The root-owned oneshot service runs
+The root-owned oneshot service runs
 `/usr/lib/epimetheus-blue/blue-firewall-helper boot`, in the host network
 namespace, to restore **only confirmed policy**. No unconfirmed policy becomes
 a reboot default. With no confirmed policy, boot must not invent a baseline.
@@ -136,8 +134,9 @@ stays under `/etc/epimetheus-blue/firewall/`.
 
 Use the client's explicit **Disable** operation to remove **only**
 `table inet epimetheus_blue`. Foreign firewall tables are untouched. This is
-not a global firewall-off switch; other tools may still filter traffic. To
-remove boot enablement as well, separately use:
+not a global firewall-off switch; other tools may still filter traffic. Disable
+also disables the fixed boot service. Merely running this command does not
+remove live rules:
 
 ```bash
 sudo systemctl disable blue-firewall.service

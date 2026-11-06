@@ -1,0 +1,149 @@
+# Maintainer: Epimetheus Blue contributors
+
+pkgname=epimetheus-blue
+pkgver=0.5.0
+pkgrel=1
+pkgdesc='Native personal security suite with malware, integrity, DNS and browser protection'
+arch=('x86_64')
+url='https://github.com/paarthbhatt/epimetheus-blue'
+license=('MIT')
+# eframe dlopens several display/OpenGL libraries. Keep these runtime
+# dependencies even when an ELF-only dependency scanner reports them unused.
+depends=(
+  'glibc'
+  'gcc-libs'
+  'fontconfig'
+  'libglvnd'
+  'libx11'
+  'libxcursor'
+  'libxi'
+  'libxrandr'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'wayland'
+  'systemd'
+)
+# The locked Cranelift/Wasmtime dependencies require Rust 1.95 or newer.
+makedepends=('cargo>=1.95' 'pkgconf')
+checkdepends=('nodejs' 'desktop-file-utils')
+optdepends=(
+  'clamav: optional clamd malware scanning'
+  'chromium: optional Search Guard browser companion'
+  'brave-bin: optional Search Guard browser companion'
+  'nftables: optional host firewall'
+  'polkit: administrator authorization for the optional firewall helper'
+  'networkmanager: separately configured system DNS routing'
+  'libcap: separately configured DNS port-53 capability'
+  'python: optional setup scripts'
+  'sudo: confirmation-gated optional setup scripts'
+  'pacman-contrib: optional system cleanup plans'
+)
+backup=(
+  'etc/chromium/native-messaging-hosts/com.epimetheus.blue.json'
+  'etc/brave/native-messaging-hosts/com.epimetheus.blue.json'
+)
+source=("${url}/releases/download/v${pkgver}/${pkgname}-${pkgver}-source.tar.gz")
+# RELEASE BLOCKER: the parent release session must replace this deliberately
+# failing, non-SKIP placeholder with the SHA-256 of the frozen source asset,
+# then regenerate .SRCINFO. Never publish this as a verified source checksum.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+prepare() {
+  cd "$srcdir/$pkgname-$pkgver"
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export BLUE_EXTENSION_DIR='/usr/share/epimetheus-blue/browser-extension'
+  cargo build --release --locked --offline --workspace
+}
+
+check() {
+  cd "$srcdir/$pkgname-$pkgver"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export BLUE_EXTENSION_DIR='/usr/share/epimetheus-blue/browser-extension'
+  cargo test --release --locked --offline --workspace
+
+  local script
+  for script in scripts/*.sh; do
+    bash -n "$script"
+  done
+  node browser-extension/scripts/validate.mjs
+  desktop-file-validate packaging/epimetheus-blue.desktop
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+  # makepkg's fakeroot archive and pacman provide root:root ownership. Neither
+  # executable is setuid, capability-bearing, or linked into a user's checkout.
+  install -Dm755 "$srcdir/target/release/blue" "$pkgdir/usr/bin/blue"
+  install -Dm755 "$srcdir/target/release/blue-firewall-helper" \
+    "$pkgdir/usr/lib/epimetheus-blue/blue-firewall-helper"
+  # argv[0]'s basename selects native messaging; a wrapper executing plain blue
+  # would lose that alias and parse the browser's arguments as ordinary CLI input.
+  ln -s blue "$pkgdir/usr/bin/blue-native-host"
+
+  local asset script unit destination extension_id
+  while IFS= read -r -d '' asset; do
+    install -Dm644 "$asset" "$pkgdir/usr/share/$pkgname/$asset"
+  done < <(find browser-extension -type f -print0)
+  for script in setup-system-dns.sh setup-clamav.sh cleanup-system.sh; do
+    install -Dm755 "scripts/$script" "$pkgdir/usr/share/$pkgname/scripts/$script"
+  done
+
+  # Only the firewall boot unit belongs to the system manager. All other units
+  # keep their existing user-service sandboxing, with a package-owned executable.
+  for unit in packaging/blue-*.service packaging/blue-*.timer; do
+    [[ "$unit" != 'packaging/blue-firewall.service' ]] || continue
+    destination="$pkgdir/usr/lib/systemd/user/${unit##*/}"
+    install -Dm644 "$unit" "$destination"
+    sed -i -E 's#^ExecStart=%h/\.local/bin/blue([[:space:]]|$)#ExecStart=/usr/bin/blue\1#' \
+      "$destination"
+    if grep -q '^ExecStart=%h/\.local/bin/blue' "$destination"; then
+      printf 'Unrewritten user-service executable: %s\n' "$unit" >&2
+      return 1
+    fi
+  done
+  install -Dm644 packaging/blue-firewall.service \
+    "$pkgdir/usr/lib/systemd/system/blue-firewall.service"
+  install -Dm644 packaging/com.epimetheus.blue.firewall.policy \
+    "$pkgdir/usr/share/polkit-1/actions/com.epimetheus.blue.firewall.policy"
+
+  install -Dm644 packaging/epimetheus-blue.desktop \
+    "$pkgdir/usr/share/applications/epimetheus-blue.desktop"
+  sed -i 's|^Exec=blue$|Exec=/usr/bin/blue|' \
+    "$pkgdir/usr/share/applications/epimetheus-blue.desktop"
+
+  extension_id="$(<browser-extension/EXTENSION_ID)"
+  if [[ ! "$extension_id" =~ ^[a-p]{32}$ ]]; then
+    printf 'Invalid stable browser extension ID\n' >&2
+    return 1
+  fi
+  # System-wide registration does not enable the extension or edit any profile.
+  for destination in \
+    "$pkgdir/etc/chromium/native-messaging-hosts/com.epimetheus.blue.json" \
+    "$pkgdir/etc/brave/native-messaging-hosts/com.epimetheus.blue.json"; do
+    install -Dm644 /dev/null "$destination"
+    cat > "$destination" <<EOF
+{
+  "name": "com.epimetheus.blue",
+  "description": "Epimetheus Blue native browser host",
+  "path": "/usr/bin/blue-native-host",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://$extension_id/"]
+}
+EOF
+  done
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  for asset in docs/*.md; do
+    install -Dm644 "$asset" "$pkgdir/usr/share/doc/$pkgname/${asset##*/}"
+  done
+
+  # Deliberately no .install hooks, presets, default policy, credentials,
+  # setcap, service activation, firewall commands, or DNS configuration.
+}

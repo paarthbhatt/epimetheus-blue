@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a non-security defect in the experimental release.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Suspected vulnerabilities belong in [private reporting](https://github.com/paarthbhatt/epimetheus-blue/security/advisories/new), never public issues.
+        Use harmless fixtures. Do not upload API/private keys, malware samples, browsing history, browser profiles, or full state/config/log archives.
+  - type: input
+    id: version
+    attributes:
+      label: Blue version and source revision
+      description: Release/version (blue --version), plus commit if built from source. Mark unknown if unavailable.
+      placeholder: "v0.5.0; commit ..."
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: OS, installation method, and relevant runtime versions
+      description: Include versions, not full environment dumps. Redact usernames, hostnames, private paths/domains and addresses.
+      placeholder: |
+        Distribution/version and kernel:
+        Architecture:
+        Install method (source/local installer/package/archive) and package version:
+        Rust/Cargo versions (source builds):
+        Wayland/X11, desktop and graphics driver (GUI issues):
+        systemd/nftables/Polkit versions (firewall issues):
+        NetworkManager/ClamAV versions (if involved):
+        Chromium/Brave version (extension issues):
+        Relevant optional features enabled; otherwise unavailable/not applicable:
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal harmless reproduction
+      description: Exact commands or UI steps and relevant non-secret settings. Do not activate privileged host components merely to reproduce a bug.
+      placeholder: |
+        1.
+        2.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      placeholder: |
+        Expected:
+        Actual (include exact error, pending/degraded state, or namespace SKIP reason):
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostic excerpts (optional)
+      description: Paste only minimal, manually reviewed/redacted excerpts, such as relevant blue verify or blue firewall status output. These are local snapshots, not proof of protection. No API keys, environment/config dumps, browsing history, DNS/network captures, malware, or archive uploads.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Reporting safety
+      options:
+        - label: I will use private reporting for suspected vulnerabilities.
+          required: true
+        - label: I reviewed and sanitized this report; it includes no secrets, API keys, live malware, browsing history, or private profile/state archives.
+          required: true

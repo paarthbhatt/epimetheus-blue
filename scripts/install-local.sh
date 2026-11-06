@@ -64,7 +64,15 @@ EOF
 }
 
 cd "$root"
-cargo build --release --locked
+case "${1:-}" in
+  '') cargo build --release --locked ;;
+  --from-binary)
+    [[ $# == 1 ]] || die '--from-binary accepts no extra arguments'
+    [[ -x target/release/blue && -x target/release/blue-firewall-helper ]] \
+      || die 'release binaries missing; use the complete release archive'
+    ;;
+  *) die 'usage: install-local.sh [--from-binary]' ;;
+esac
 
 install -d \
   "$bindir" \
