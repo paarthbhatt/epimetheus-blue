@@ -59,6 +59,8 @@ enum Cmd {
     Reputation(ReputationArgs),
     /// Analyze and explicitly apply bounded storage cleanup candidates.
     Cleanup(CleanupArgs),
+    /// Windows-style inbound firewall with approval and rollback.
+    Firewall(FirewallArgs),
     /// Prove the pipeline works end to end with the EICAR string.
     Drill,
     /// Check configuration, state, rules and detectors.
@@ -123,6 +125,42 @@ enum ReputationCmd {
 struct CleanupArgs {
     #[command(subcommand)]
     cmd: CleanupCmd,
+}
+
+#[derive(Args)]
+struct FirewallArgs {
+    #[command(subcommand)]
+    cmd: FirewallCmd,
+}
+
+#[derive(Subcommand)]
+enum FirewallCmd {
+    /// Read sanitized local firewall status; no privilege prompt.
+    Status,
+    /// Render a policy without applying it.
+    Plan {
+        #[arg(long, default_value = "public")]
+        profile: String,
+    },
+    /// Stage rules for 60 seconds; explicit confirmation and polkit required.
+    Apply {
+        #[arg(long, default_value = "public")]
+        profile: String,
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Keep the staged policy and persist it for reboot.
+    Confirm {
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Restore the policy saved before the staged change.
+    Rollback,
+    /// Remove only Blue's firewall table.
+    Disable {
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,6 +242,7 @@ fn run() -> Result<()> {
         Some(Cmd::Feeds(args)) => cmd_feeds(&ctx, args),
         Some(Cmd::Reputation(args)) => cmd_reputation(&ctx, args),
         Some(Cmd::Cleanup(args)) => cmd_cleanup(&ctx, args),
+        Some(Cmd::Firewall(args)) => cmd_firewall(args),
         Some(Cmd::Drill) => cmd_drill(&ctx),
         Some(Cmd::Verify) => cmd_verify(&ctx),
     }
@@ -560,6 +599,50 @@ fn cmd_reputation(ctx: &Ctx, args: ReputationArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_firewall(args: FirewallArgs) -> Result<()> {
+    use blue_firewall::{FirewallClient, FirewallPolicy};
+    let client = FirewallClient::new();
+    match args.cmd {
+        FirewallCmd::Status => println!("{}", serde_json::to_string_pretty(&client.status()?)?),
+        FirewallCmd::Plan { profile } => println!(
+            "{}",
+            FirewallPolicy::new(parse_firewall_profile(&profile)?).render_nft()?
+        ),
+        FirewallCmd::Apply { profile, confirm } => {
+            require_firewall_confirmation(&confirm, "APPLY FIREWALL")?;
+            println!(
+                "{}",
+                client.apply(&FirewallPolicy::new(parse_firewall_profile(&profile)?))?
+            );
+        }
+        FirewallCmd::Confirm { confirm } => {
+            require_firewall_confirmation(&confirm, "KEEP FIREWALL")?;
+            println!("{}", client.confirm()?);
+        }
+        FirewallCmd::Rollback => println!("{}", client.rollback()?),
+        FirewallCmd::Disable { confirm } => {
+            require_firewall_confirmation(&confirm, "DISABLE FIREWALL")?;
+            println!("{}", client.disable()?);
+        }
+    }
+    Ok(())
+}
+
+fn parse_firewall_profile(profile: &str) -> Result<blue_firewall::FirewallProfile> {
+    match profile {
+        "public" => Ok(blue_firewall::FirewallProfile::Public),
+        "private" => Ok(blue_firewall::FirewallProfile::Private),
+        _ => bail!("profile must be public or private"),
+    }
+}
+
+fn require_firewall_confirmation(actual: &str, expected: &str) -> Result<()> {
+    if actual != expected {
+        bail!("confirmation must exactly match `{expected}`");
+    }
+    Ok(())
+}
+
 fn cmd_cleanup(ctx: &Ctx, args: CleanupArgs) -> Result<()> {
     let engine = blue_cleanup::CleanupEngine::new(
         ctx.db.clone(),
@@ -867,4 +950,23 @@ fn init_tracing(level: &str) {
         )
         .with_target(false)
         .try_init();
+}
+
+#[cfg(test)]
+mod firewall_cli_tests {
+    use super::*;
+
+    #[test]
+    fn applying_requires_a_confirmation_argument() {
+        assert!(Cli::try_parse_from(["blue", "firewall", "apply", "--profile", "public"]).is_err());
+    }
+
+    #[test]
+    fn confirmation_is_exact_and_profiles_are_bounded() {
+        assert!(require_firewall_confirmation("APPLY FIREWALL", "APPLY FIREWALL").is_ok());
+        assert!(require_firewall_confirmation("apply firewall", "APPLY FIREWALL").is_err());
+        assert!(parse_firewall_profile("public").is_ok());
+        assert!(parse_firewall_profile("private").is_ok());
+        assert!(parse_firewall_profile("public; flush ruleset").is_err());
+    }
 }

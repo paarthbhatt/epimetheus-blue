@@ -102,6 +102,14 @@ install -m 0755 scripts/setup-system-dns.sh "$appdir/scripts/setup-system-dns.sh
 install -m 0755 scripts/setup-clamav.sh "$appdir/scripts/setup-clamav.sh"
 install -m 0755 scripts/cleanup-system.sh "$appdir/scripts/cleanup-system.sh"
 
+# Optional privileged bundle: copied locally, never installed as root or enabled.
+firewall_bundle="$appdir/firewall-install"
+install -d "$firewall_bundle/target/release" "$firewall_bundle/packaging" "$firewall_bundle/scripts"
+install -m 0755 target/release/blue-firewall-helper "$firewall_bundle/target/release/blue-firewall-helper"
+install -m 0755 scripts/install-firewall.sh "$firewall_bundle/scripts/install-firewall.sh"
+install -m 0644 packaging/blue-firewall.service "$firewall_bundle/packaging/blue-firewall.service"
+install -m 0644 packaging/com.epimetheus.blue.firewall.policy "$firewall_bundle/packaging/com.epimetheus.blue.firewall.policy"
+
 write_native_manifest "$chromium_host_dir"
 write_native_manifest "$brave_host_dir"
 
@@ -154,4 +162,7 @@ ClamAV setup plan:
 
 System cleanup plan (read-only):
   $appdir/scripts/cleanup-system.sh plan
+
+Optional firewall installer plan (no live rules applied):
+  $appdir/firewall-install/scripts/install-firewall.sh plan
 EOF

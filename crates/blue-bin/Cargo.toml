@@ -20,6 +20,7 @@ blue-net = { path = "../blue-net" }
 blue-reputation = { path = "../blue-reputation" }
 blue-native-host = { path = "../blue-native-host" }
 blue-cleanup = { path = "../blue-cleanup" }
+blue-firewall = { path = "../blue-firewall" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true

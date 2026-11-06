@@ -59,6 +59,7 @@ enum Page {
     Scanner,
     Integrity,
     Network,
+    Firewall,
     Reputation,
     Cleanup,
     Quarantine,
@@ -101,6 +102,7 @@ enum JobResult {
     Scan(Result<ScanSummary, String>),
     Guard(Result<GuardReport, String>),
     Network(Result<blue_net::NetReport, String>),
+    Firewall(Result<String, String>),
     ReputationSync(Result<blue_reputation::HashSyncReport, String>),
     ReputationCheck(Result<blue_reputation::ReputationResult, String>),
     CleanupScan(
@@ -142,6 +144,13 @@ struct BlueApp {
     last_scan: Option<ScanSummary>,
     last_guard: Option<GuardReport>,
     last_net: Option<blue_net::NetReport>,
+    firewall_policy: blue_firewall::FirewallPolicy,
+    firewall_status: blue_firewall::FirewallStatus,
+    firewall_approval: bool,
+    firewall_rule_name: String,
+    firewall_rule_port: String,
+    firewall_rule_source: String,
+    firewall_rule_udp: bool,
     reputation_status: Option<blue_reputation::ReputationStatus>,
     reputation_result: Option<blue_reputation::ReputationResult>,
     reputation_path: String,
@@ -205,6 +214,17 @@ impl BlueApp {
             last_scan: None,
             last_guard: None,
             last_net: None,
+            firewall_policy: blue_firewall::FirewallPolicy::new(
+                blue_firewall::FirewallProfile::Public,
+            ),
+            firewall_status: blue_firewall::FirewallClient::new()
+                .status()
+                .unwrap_or_default(),
+            firewall_approval: false,
+            firewall_rule_name: String::new(),
+            firewall_rule_port: String::new(),
+            firewall_rule_source: String::new(),
+            firewall_rule_udp: false,
             reputation_status: None,
             reputation_result: None,
             reputation_path,
@@ -330,6 +350,15 @@ impl BlueApp {
                         }
                         Err(error) => self.message = Some((error, false)),
                     }
+                }
+                JobResult::Firewall(result) => {
+                    self.jobs.remove("firewall");
+                    self.firewall_approval = false;
+                    self.message = Some(match result {
+                        Ok(message) => (message, true),
+                        Err(error) => (format!("Firewall operation failed: {error}"), false),
+                    });
+                    self.refresh_firewall();
                 }
                 JobResult::ReputationSync(result) => {
                     self.jobs.remove("reputation-sync");
@@ -482,6 +511,35 @@ impl BlueApp {
                 .run_once()
                 .map_err(|error| format!("Integrity check failed: {error:#}"));
             let _ = tx.send(JobResult::Guard(result));
+        });
+    }
+
+    fn refresh_firewall(&mut self) {
+        self.firewall_status = blue_firewall::FirewallClient::new()
+            .status()
+            .unwrap_or_else(|error| blue_firewall::FirewallStatus {
+                message: error.to_string(),
+                ..Default::default()
+            });
+    }
+
+    fn run_firewall(&mut self, action: &'static str) {
+        if !self.jobs.insert("firewall") {
+            return;
+        }
+        let policy = self.firewall_policy.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let client = blue_firewall::FirewallClient::new();
+            let result = match action {
+                "apply" => client.apply(&policy),
+                "confirm" => client.confirm(),
+                "rollback" => client.rollback(),
+                "disable" => client.disable(),
+                _ => Err(anyhow::anyhow!("unknown firewall action")),
+            }
+            .map_err(|error| error.to_string());
+            let _ = tx.send(JobResult::Firewall(result));
         });
     }
 
@@ -828,6 +886,7 @@ impl BlueApp {
                     (Page::Scanner, "⌕", "Scanner"),
                     (Page::Integrity, "⌁", "Integrity"),
                     (Page::Network, "⇄", "Network"),
+                    (Page::Firewall, "▣", "Firewall"),
                     (Page::Reputation, "#", "Reputation"),
                     (Page::Cleanup, "◫", "Cleanup"),
                     (Page::Quarantine, "◇", "Quarantine"),
@@ -901,6 +960,7 @@ impl BlueApp {
                         .stroke(Stroke::new(1.0, if paused { GREEN } else { RED }))
                         .corner_radius(8.0),
                     )
+                    .on_hover_text("Pauses automatic file quarantine only; firewall and system DNS are not changed.")
                     .clicked()
                 {
                     self.toggle_kill_switch();
@@ -1163,6 +1223,207 @@ impl BlueApp {
                             finding_row(ui, finding, |id| self.acknowledge(id));
                         }
                     });
+            }
+        });
+    }
+
+    fn firewall(&mut self, ui: &mut egui::Ui) {
+        self.header(ui, "Defender-style firewall", "Stateful inbound protection for Arch Linux; outgoing traffic and DNS remain unchanged.");
+        surface(ui, |ui| {
+            section_title(ui, "Protection state", &self.firewall_status.message);
+            if let Some(profile) = self.firewall_status.profile {
+                ui.label(format!("Reported profile: {profile:?}"));
+            }
+            ui.label(
+                RichText::new(if self.firewall_status.pending {
+                    "STAGED — automatically rolls back unless confirmed"
+                } else if self.firewall_status.active {
+                    "ACTIVE"
+                } else {
+                    "NOT ACTIVE"
+                })
+                .strong()
+                .color(if self.firewall_status.active {
+                    GREEN
+                } else {
+                    AMBER
+                }),
+            );
+            if !self.firewall_status.installed {
+                ui.label("Privileged helper is not installed. Planning is available; activation requires the separate installer.");
+                if ui.button("Copy firewall installer plan command").clicked() {
+                    let base = extension_path()
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    let installed = base.join("firewall-install/scripts/install-firewall.sh");
+                    let script = if installed.exists() {
+                        installed
+                    } else {
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../scripts/install-firewall.sh")
+                    };
+                    ui.ctx().copy_text(format!("{} plan", script.display()));
+                }
+            }
+        });
+        ui.add_space(14.0);
+        self.firewall_editor(ui);
+        ui.add_space(14.0);
+        self.firewall_actions(ui);
+    }
+
+    fn firewall_editor(&mut self, ui: &mut egui::Ui) {
+        surface(ui, |ui| {
+            section_title(ui, "Draft policy", "New unsolicited inbound traffic is blocked. Existing connections, ICMP and DHCP are preserved.");
+            ui.horizontal(|ui| {
+                let public = ui.selectable_value(
+                    &mut self.firewall_policy.profile,
+                    blue_firewall::FirewallProfile::Public,
+                    "Public",
+                );
+                let private = ui.selectable_value(
+                    &mut self.firewall_policy.profile,
+                    blue_firewall::FirewallProfile::Private,
+                    "Private / LAN discovery",
+                );
+                if public.changed() || private.changed() {
+                    self.firewall_approval = false;
+                }
+            });
+            self.firewall_rule_editor(ui);
+            egui::CollapsingHeader::new("Inspect generated nftables policy").show(ui, |ui| {
+                match self.firewall_policy.render_nft() {
+                    Ok(policy) => {
+                        ui.code(policy);
+                    }
+                    Err(error) => {
+                        ui.colored_label(RED, error.to_string());
+                    }
+                }
+            });
+            ui.label(RichText::new("Only Blue's own inet table is managed. Forwarded Docker/VPN traffic is not governed by this baseline.").size(11.0).color(MUTED));
+        });
+    }
+
+    fn firewall_rule_editor(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Explicit inbound exceptions").strong());
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.firewall_rule_name)
+                    .hint_text("Name")
+                    .desired_width(150.0),
+            );
+            ui.checkbox(&mut self.firewall_rule_udp, "UDP (otherwise TCP)");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.firewall_rule_port)
+                    .hint_text("Port")
+                    .desired_width(60.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.firewall_rule_source)
+                    .hint_text("Optional source CIDR")
+                    .desired_width(180.0),
+            );
+            if ui.button("Add").clicked() {
+                self.add_firewall_rule();
+            }
+        });
+        let mut remove = None;
+        for (index, rule) in self.firewall_policy.inbound.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} · {:?}/{} · {}",
+                    rule.name,
+                    rule.protocol,
+                    rule.port,
+                    rule.source.as_deref().unwrap_or("any source")
+                ));
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            self.firewall_policy.inbound.remove(index);
+            self.firewall_approval = false;
+        }
+    }
+
+    fn add_firewall_rule(&mut self) {
+        let Ok(port) = self.firewall_rule_port.parse::<u16>() else {
+            self.message = Some(("Enter a valid port from 1 to 65535".into(), false));
+            return;
+        };
+        let mut draft = self.firewall_policy.clone();
+        draft.inbound.push(blue_firewall::InboundRule {
+            name: self.firewall_rule_name.trim().to_owned(),
+            protocol: if self.firewall_rule_udp {
+                blue_firewall::Protocol::Udp
+            } else {
+                blue_firewall::Protocol::Tcp
+            },
+            port,
+            source: (!self.firewall_rule_source.trim().is_empty())
+                .then(|| self.firewall_rule_source.trim().to_owned()),
+        });
+        match draft.validate() {
+            Ok(()) => {
+                self.firewall_policy = draft;
+                self.firewall_approval = false;
+            }
+            Err(error) => self.message = Some((error.to_string(), false)),
+        }
+    }
+
+    fn firewall_actions(&mut self, ui: &mut egui::Ui) {
+        surface(ui, |ui| {
+            section_title(
+                ui,
+                "Apply with automatic rollback",
+                "Administrator approval is required. Unconfirmed changes revert after 60 seconds.",
+            );
+            let ready = self.firewall_status.installed && !self.jobs.contains("firewall");
+            if self.firewall_status.pending {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(ready, egui::Button::new("Keep staged policy"))
+                        .clicked()
+                    {
+                        self.run_firewall("confirm");
+                    }
+                    if ui
+                        .add_enabled(ready, egui::Button::new("Undo staged change now"))
+                        .clicked()
+                    {
+                        self.run_firewall("rollback");
+                    }
+                });
+            } else {
+                ui.checkbox(
+                    &mut self.firewall_approval,
+                    "I reviewed the policy and approve the selected firewall action",
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            ready && self.firewall_approval,
+                            egui::Button::new("Stage firewall policy"),
+                        )
+                        .clicked()
+                    {
+                        self.run_firewall("apply");
+                    }
+                    if ui
+                        .add_enabled(
+                            ready && self.firewall_approval && self.firewall_status.active,
+                            egui::Button::new("Disable Blue rules"),
+                        )
+                        .clicked()
+                    {
+                        self.run_firewall("disable");
+                    }
+                });
             }
         });
     }
@@ -1955,6 +2216,7 @@ impl eframe::App for BlueApp {
         self.process_jobs();
         if self.last_refresh.elapsed() > Duration::from_secs(2) {
             self.refresh();
+            self.refresh_firewall();
         }
         self.sidebar(ui);
         egui::CentralPanel::default()
@@ -1964,6 +2226,11 @@ impl eframe::App for BlueApp {
                 Page::Scanner => self.scanner(ui),
                 Page::Integrity => self.integrity(ui),
                 Page::Network => self.network(ui),
+                Page::Firewall => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("firewall-page")
+                        .show(ui, |ui| self.firewall(ui));
+                }
                 Page::Reputation => self.reputation(ui),
                 Page::Cleanup => {
                     egui::ScrollArea::vertical()

@@ -318,13 +318,14 @@ dependencies = [
 
 [[package]]
 name = "blue-bin"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-cleanup",
  "blue-core",
  "blue-dns",
  "blue-feeds",
+ "blue-firewall",
  "blue-guard",
  "blue-native-host",
  "blue-net",
@@ -341,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "blue-cleanup"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -352,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "blue-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -368,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "blue-dns"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -383,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "blue-feeds"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -393,8 +394,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "blue-firewall"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "ipnet",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "blue-firewall-helper"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "blue-firewall",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "blue-guard"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -409,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "blue-native-host"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -421,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "blue-net"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -432,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "blue-reputation"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -447,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "blue-scan"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -466,13 +490,14 @@ dependencies = [
 
 [[package]]
 name = "blue-ui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blue-cleanup",
  "blue-core",
  "blue-dns",
  "blue-feeds",
+ "blue-firewall",
  "blue-guard",
  "blue-net",
  "blue-reputation",
@@ -2012,6 +2037,12 @@ checksum = "6928282826c822ad91bf1c9a1cb90a30ba1c26770749929b4656cd6be829cd7c"
 dependencies = [
  "rustversion",
 ]
+
+[[package]]
+name = "ipnet"
+version = "2.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "is_terminal_polyfill"

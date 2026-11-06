@@ -13,6 +13,7 @@ temporary_config=''
 
 declare -a CLAMAV_UNITS=()
 declare -a FRESHCLAM_UNITS=()
+declare -a FRESHCLAM_ONCE_UNITS=()
 declare -a DAEMON_UNITS=()
 declare -a OTHER_CLAMAV_UNITS=()
 declare -a CLAMD_SOCKETS=()
@@ -102,6 +103,7 @@ discover_clamav_units() {
   local -A seen=()
   CLAMAV_UNITS=()
   FRESHCLAM_UNITS=()
+  FRESHCLAM_ONCE_UNITS=()
   DAEMON_UNITS=()
   OTHER_CLAMAV_UNITS=()
 
@@ -113,6 +115,7 @@ discover_clamav_units() {
     seen[$unit]=1
     CLAMAV_UNITS+=("$unit")
     case "$unit" in
+      *freshclam*once*) FRESHCLAM_ONCE_UNITS+=("$unit") ;;
       *freshclam*) FRESHCLAM_UNITS+=("$unit") ;;
       *daemon*|*clamd*) DAEMON_UNITS+=("$unit") ;;
       *) OTHER_CLAMAV_UNITS+=("$unit") ;;
@@ -134,6 +137,9 @@ print_discovered_units() {
   done
   for unit in "${OTHER_CLAMAV_UNITS[@]}"; do
     printf '  %s (not auto-enabled)\n' "$unit"
+  done
+  for unit in "${FRESHCLAM_ONCE_UNITS[@]}"; do
+    printf '  %s (one-shot; disabled when using the background updater)\n' "$unit"
   done
 }
 
@@ -367,6 +373,14 @@ install_clamav() {
   print_discovered_units
   ((${#DAEMON_UNITS[@]} > 0)) \
     || die 'no clamav daemon service was discovered; no service was auto-enabled'
+
+  # Two freshclam processes race for the same log/database lock at boot.
+  if ((${#FRESHCLAM_UNITS[@]} > 0)); then
+    for unit in "${FRESHCLAM_ONCE_UNITS[@]}"; do
+      printf 'Disabling conflicting one-shot updater: %s\n' "$unit"
+      sudo systemctl disable --now "$unit"
+    done
+  fi
 
   if ! definitions_present; then
     require_commands freshclam

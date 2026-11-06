@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Epimetheus Blue</vendor>
+  <action id="com.epimetheus.blue.firewall">
+    <description>Manage the Epimetheus Blue firewall</description>
+    <message>Administrator authentication is required to change the Epimetheus Blue firewall.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <!-- No retained authorization, shell wrapper, or GUI environment access.
+         The helper independently validates its fixed verbs and JSON input. -->
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/epimetheus-blue/blue-firewall-helper</annotate>
+  </action>
+</policyconfig>

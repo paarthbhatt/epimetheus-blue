@@ -22,10 +22,27 @@ is no local website, HTTP API, Electron shell, or embedded web view.
 | Filter feeds | Download, validate, atomically activate, retain previous, roll back |
 | Hash reputation | Local exact SHA-256 IOC feeds plus opt-in hash-only VirusTotal queries |
 | Egress observer | Read-only procfs baseline and one-time alerts for new public destinations |
+| Firewall | Stateful IPv4/IPv6 inbound baseline with staged approval, automatic rollback and explicit exceptions |
 | Storage cleanup | Risk-classified scan, explicit item selection and typed confirmation; no automatic deletion |
 | Browser/search shield | Chromium/Brave MV3 extension with a read-only native desktop bridge |
 
 ## Native app
+
+### Arch Defender-style firewall
+
+The native **Firewall** page offers Public/Private profiles and explicit inbound
+port/CIDR exceptions. It manages only `table inet epimetheus_blue`; it never
+flushes existing firewall rules or changes DNS, outbound or forwarded traffic.
+The root-owned helper is installed separately after administrator approval.
+Unconfirmed staged rules automatically roll back after 60 seconds.
+
+```bash
+blue firewall plan --profile public
+./scripts/install-firewall.sh plan
+```
+
+Read [`docs/FIREWALL.md`](docs/FIREWALL.md) before installing or activating it.
+This is firewall functionality, not a claim of Defender malware-detection parity.
 
 ```bash
 cargo build --release
@@ -97,6 +114,8 @@ blue scan ~/Downloads       # one-off scan
 blue watch                  # realtime watcher in the foreground
 blue guard                  # integrity/persistence check
 blue network                # observe public egress; never changes firewall rules
+blue firewall status        # read local firewall state
+blue firewall plan --profile public # inspect rules; makes no changes
 blue feeds sync             # update domain filters
 blue feeds ls               # list active local lists
 blue feeds rollback NAME    # restore previous list version

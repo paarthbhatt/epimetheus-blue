@@ -1,0 +1,39 @@
+[Unit]
+Description=Epimetheus Blue confirmed firewall policy
+After=local-fs.target
+Wants=network-pre.target
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/lib/epimetheus-blue/blue-firewall-helper boot
+RemainAfterExit=yes
+TimeoutStartSec=30s
+UMask=0077
+
+# Stay in the host network namespace: an isolated namespace would protect
+# neither the host nor its incoming connections.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+ConfigurationDirectory=epimetheus-blue/firewall
+ConfigurationDirectoryMode=0700
+RuntimeDirectory=epimetheus-blue
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/etc/epimetheus-blue/firewall /run/epimetheus-blue
+
+[Install]
+WantedBy=multi-user.target

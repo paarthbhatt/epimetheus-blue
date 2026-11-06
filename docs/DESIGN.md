@@ -127,6 +127,8 @@ blue/
 │   ├── blue-net/               # read-only procfs egress observer
 │   ├── blue-native-host/       # bounded read-only browser messaging
 │   ├── blue-cleanup/           # risk-classified storage/performance inventory
+│   ├── blue-firewall/          # pure nftables policy + unprivileged client
+│   ├── blue-firewall-helper/   # fixed-verb root helper with rollback
 │   └── blue-ui/                # native eframe/egui Wayland/X11 application
 ├── browser-extension/          # Chromium/Brave MV3 search companion
 ├── packaging/                  # desktop entry and systemd user units
@@ -676,6 +678,16 @@ Not "zero infections". Success is:
 ---
 
 ## 16. Implementation status
+
+### Arch firewall milestone
+
+`blue-firewall` now provides Public/Private stateful inbound policies and numeric
+port/CIDR exceptions. `blue-firewall-helper` is a separate root-owned program
+with fixed verbs, authenticated activation, atomic own-table replacement and an
+independent 60-second rollback timer. Confirmed policies persist for reboot.
+The native Firewall tab and CLI expose planning and explicit activation; building
+and installing the user app never activate live rules or change system DNS.
+See [`FIREWALL.md`](FIREWALL.md) for installation and activation boundaries.
 
 Built on 2026-11-03. `blue drill` passes end to end; the resolver and browser
 extension have live smoke tests. The current workspace test count is recorded in
