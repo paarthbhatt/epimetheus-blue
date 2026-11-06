@@ -7,7 +7,7 @@ pkgbase = epimetheus-blue
 	license = MIT
 	checkdepends = nodejs
 	checkdepends = desktop-file-utils
-	makedepends = cargo>=1.95
+	makedepends = rust>=1.95
 	makedepends = pkgconf
 	depends = glibc
 	depends = gcc-libs
@@ -31,9 +31,10 @@ pkgbase = epimetheus-blue
 	optdepends = python: optional setup scripts
 	optdepends = sudo: confirmation-gated optional setup scripts
 	optdepends = pacman-contrib: optional system cleanup plans
+	options = !lto
 	backup = etc/chromium/native-messaging-hosts/com.epimetheus.blue.json
 	backup = etc/brave/native-messaging-hosts/com.epimetheus.blue.json
 	source = https://github.com/paarthbhatt/epimetheus-blue/releases/download/v0.5.0/epimetheus-blue-0.5.0-source.tar.gz
-	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+	sha256sums = 05129bdae41c8da320752adeac9584c39e30a66376bca87ef8cc9f525afb493b
 
 pkgname = epimetheus-blue

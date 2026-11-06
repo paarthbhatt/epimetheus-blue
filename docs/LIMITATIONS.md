@@ -95,10 +95,10 @@ also requires nftables, systemd, Polkit, and an authentication agent.
 
 ClamAV signatures are not bundled or updated by Blue; `freshclam` remains separate.
 The optional bounded `pacman -Qkk` audit can be slow, time out, or be unavailable;
-it reports drift, not malware proof or automatic package repair. The workspace's
-Rust 1.85 declaration is not a tested minimum for the entire locked dependency
-graph; use the toolchain recorded for the exact revision. Browser support is the
-Chromium/Brave MV3 companion, not every browser or page layout.
+it reports drift, not malware proof or automatic package repair. The workspace and
+locked dependency graph require Rust 1.95 or newer; use the toolchain recorded for
+the exact revision. Browser support is the Chromium/Brave MV3 companion, not every
+browser or page layout.
 
 Do not assume an experimental archive/local install provides distro support,
 automatic upgrades, reproducible builds, or signed artifacts. Disable separately

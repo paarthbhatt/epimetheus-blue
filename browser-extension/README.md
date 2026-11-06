@@ -45,7 +45,7 @@ native-host installer. No private key is stored in this repository.
 
 ## Install in Chromium or Brave
 
-1. Open `chromium://extensions` or `brave://extensions`.
+1. Open `chrome://extensions` or `brave://extensions`.
 2. Enable **Developer mode**.
 3. Select **Load unpacked**.
 4. Choose this `browser-extension/` directory.

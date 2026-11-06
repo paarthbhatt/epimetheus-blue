@@ -151,7 +151,7 @@ Native app:
 
 Browser extension:
   $appdir/browser-extension
-  Load it unpacked from chromium://extensions or brave://extensions.
+  Load it unpacked from chrome://extensions or brave://extensions.
 
 Native browser host:
   $native_host_path

@@ -49,7 +49,7 @@ Validation on Arch Linux with Rust 1.99.1 (minimum locked dependency MSRV 1.95):
 
 | Validation | Tagged-commit result |
 |---|---|
-| Rust workspace build, fmt, tests, clippy | PASS — 182 tests |
+| Rust workspace build, fmt, tests, clippy | PASS — 185 tests |
 | Invariant script and browser validator | PASS |
 | Shell/Polkit XML/offline systemd packaging checks | PASS |
 | Rootless firewall netns harness | PASS — isolated synthetic traffic only |
@@ -64,6 +64,7 @@ change is required for these checks. Performance targets are not benchmark resul
 | Tag / exact source commit | `v0.5.0`; see release `BUILD_INFO.txt` |
 | Source archive | `epimetheus-blue-0.5.0-source.tar.gz` |
 | Native archive | `epimetheus-blue-0.5.0-linux-x86_64.tar.gz` |
+| Arch binary package | `epimetheus-blue-0.5.0-1-x86_64.pkg.tar.zst` — unsigned |
 | Arch build recipe | `PKGBUILD`, `.SRCINFO`, and source package |
 | Browser companion | `epimetheus-blue-search-guard-0.4.0.zip` |
 | Checksums | `SHA256SUMS` — unsigned |

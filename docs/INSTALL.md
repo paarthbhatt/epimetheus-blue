@@ -7,15 +7,14 @@ Never run Cargo, makepkg, or the user-local installer as root.
 
 ## Verify the release before building
 
-Release packaging is not complete until tag `v0.5.0` is frozen, its exact release
-source asset is hashed, and the checksum in `packaging/PKGBUILD` and
-`packaging/.SRCINFO` is finalized. An all-zero SHA-256 is a deliberately failing
-placeholder, **not** a valid release checksum. Do not use `--skipinteg`, replace
-it with `SKIP`, or disable tests to get past a release blocker.
+Release builds pin the exact frozen source asset in `packaging/PKGBUILD` and
+`packaging/.SRCINFO`. An all-zero SHA-256 is a failing placeholder, **not** a valid
+release checksum. Do not use `--skipinteg`, replace it with `SKIP`, or disable
+tests to get past a release blocker.
 
 Use the finalized Arch source package, `epimetheus-blue-0.5.0-1.src.tar.gz`,
 and the release's `SHA256SUMS`. The checksum manifest
-cover that source package and the exact `epimetheus-blue-0.5.0-source.tar.gz` asset
+covers that source package and the exact `epimetheus-blue-0.5.0-source.tar.gz` asset
 downloaded from:
 
 ```text
@@ -80,7 +79,20 @@ the release source asset; do not move the tag or replace the asset merely to
 insert a checksum. Creating a source package does not publish a release or
 submit anything to the AUR.
 
-## Option A: source-built Arch package
+## Option A: pacman-managed Arch package
+
+For installation without compiling, verify the release's
+`epimetheus-blue-0.5.0-1-x86_64.pkg.tar.zst` against `SHA256SUMS`, review the package
+contents with `pacman -Qip` and `pacman -Qlp`, then explicitly install it:
+
+```bash
+sudo pacman -U ./epimetheus-blue-0.5.0-1-x86_64.pkg.tar.zst
+```
+
+The package is unsigned; this is a local package installation, not a signed
+pacman repository. Installation enables no Blue services or firewall/DNS policy.
+
+### Build the Arch package from source
 
 Use an up-to-date Arch Linux **x86_64** environment with `base-devel`, a Rust
 toolchain providing Cargo/Rust **1.95 or newer**, and `pkgconf`. The workspace
@@ -211,7 +223,7 @@ must be reviewed separately.
 
 - **Browser companion:** manually load
   `/usr/share/epimetheus-blue/browser-extension/` through **Load unpacked** in
-  `chromium://extensions` or `brave://extensions`. For the user-local method,
+  `chrome://extensions` or `brave://extensions`. For the user-local method,
   use its installed extension directory instead. The stable ID is
   `alfkkfmnmngogkkaenefploocfbdooji`. A stale per-user native-host manifest can
   override the package registration and show “Desktop: Disconnected”.

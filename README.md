@@ -54,8 +54,9 @@ cd epimetheus-blue
 ./scripts/install-local.sh
 ```
 
-Rust 1.95+ is required. A reviewed `PKGBUILD` is supplied in the release; inspect it
-before `makepkg -si`. **No AUR listing has been submitted yet.**
+Rust 1.95+ is required. A `PKGBUILD` and a tested pacman package are supplied in the
+release; review them and follow the [package instructions](docs/INSTALL.md#option-a-pacman-managed-arch-package).
+**No AUR listing has been submitted yet.**
 
 ## A harmless one-minute demo
 

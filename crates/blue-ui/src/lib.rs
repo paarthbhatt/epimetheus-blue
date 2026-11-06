@@ -1263,7 +1263,7 @@ impl BlueApp {
                         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                             .join("../../scripts/install-firewall.sh")
                     };
-                    ui.ctx().copy_text(format!("{} plan", script.display()));
+                    ui.ctx().copy_text(script_plan_command(&script));
                 }
             }
         });
@@ -1843,10 +1843,8 @@ impl BlueApp {
                 .map(|path| path.join("scripts"))
                 .unwrap_or_else(|| PathBuf::from("scripts"));
             if ui.button("Copy system cleanup plan command").clicked() {
-                ui.ctx().copy_text(format!(
-                    "{} plan",
-                    setup_dir.join("cleanup-system.sh").display()
-                ));
+                ui.ctx()
+                    .copy_text(script_plan_command(&setup_dir.join("cleanup-system.sh")));
                 self.message = Some(("Read-only system cleanup plan command copied".into(), true));
             }
         });
@@ -2032,8 +2030,7 @@ impl BlueApp {
                 );
                 ui.add_space(12.0);
                 ui.label(
-                    RichText::new("1. Open chromium://extensions or brave://extensions")
-                        .color(TEXT),
+                    RichText::new("1. Open chrome://extensions or brave://extensions").color(TEXT),
                 );
                 ui.label(RichText::new("2. Enable Developer mode").color(TEXT));
                 ui.label(RichText::new("3. Select Load unpacked").color(TEXT));
@@ -2190,7 +2187,7 @@ impl BlueApp {
                     ui.label(RichText::new(label).color(MUTED).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("Copy plan command").clicked() {
-                            ui.ctx().copy_text(format!("{} plan", script.display()));
+                            ui.ctx().copy_text(script_plan_command(&script));
                             self.message = Some((format!("{label} plan command copied"), true));
                         }
                     });
@@ -2564,6 +2561,13 @@ fn extension_path() -> PathBuf {
     if let Some(path) = option_env!("BLUE_EXTENSION_DIR").map(PathBuf::from) {
         return path;
     }
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(path) =
+        user_extension_path(data_home.as_deref(), home.as_deref()).filter(|path| path.is_dir())
+    {
+        return path;
+    }
     let installed = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -2574,6 +2578,22 @@ fn extension_path() -> PathBuf {
     } else {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../browser-extension")
     }
+}
+
+fn user_extension_path(data_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    data_home
+        .filter(|path| path.is_absolute())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            home.filter(|path| path.is_absolute())
+                .map(|path| path.join(".local/share"))
+        })
+        .map(|path| path.join("epimetheus-blue/browser-extension"))
+}
+
+fn script_plan_command(script: &Path) -> String {
+    let quoted = script.to_string_lossy().replace('\'', "'\\''");
+    format!("'{quoted}' plan")
 }
 
 fn user_unit_exists(name: &str) -> bool {
@@ -2630,4 +2650,52 @@ fn system_dns_uses_loopback() -> bool {
                 line == "nameserver 127.0.0.1" || line == "nameserver ::1"
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{script_plan_command, user_extension_path};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn extension_assets_honor_absolute_xdg_data_home() {
+        assert_eq!(
+            user_extension_path(
+                Some(Path::new("/custom/data")),
+                Some(Path::new("/home/demo"))
+            ),
+            Some(PathBuf::from(
+                "/custom/data/epimetheus-blue/browser-extension"
+            ))
+        );
+    }
+
+    #[test]
+    fn invalid_xdg_data_home_falls_back_to_absolute_home() {
+        for data_home in [None, Some(Path::new("")), Some(Path::new("relative/data"))] {
+            assert_eq!(
+                user_extension_path(data_home, Some(Path::new("/home/demo"))),
+                Some(PathBuf::from(
+                    "/home/demo/.local/share/epimetheus-blue/browser-extension"
+                ))
+            );
+        }
+        assert_eq!(user_extension_path(None, None), None);
+        assert_eq!(
+            user_extension_path(None, Some(Path::new("relative/home"))),
+            None
+        );
+    }
+
+    #[test]
+    fn plan_commands_quote_spaces_and_shell_metacharacters() {
+        assert_eq!(
+            script_plan_command(Path::new("/tmp/Blue Data/setup.sh")),
+            "'/tmp/Blue Data/setup.sh' plan"
+        );
+        assert_eq!(
+            script_plan_command(Path::new("/tmp/a'b;$x.sh")),
+            "'/tmp/a'\\''b;$x.sh' plan"
+        );
+    }
 }

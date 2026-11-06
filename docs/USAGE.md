@@ -90,7 +90,7 @@ archive is `dist/epimetheus-blue-search-guard-0.4.0.zip`.
 
 For Chromium or Brave:
 
-1. Open `chromium://extensions` or `brave://extensions`.
+1. Open `chrome://extensions` or `brave://extensions`.
 2. Enable **Developer mode**.
 3. Select **Load unpacked**.
 4. Choose `browser-extension/` (or the installed path shown by the native app).

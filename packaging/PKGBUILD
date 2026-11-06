@@ -7,6 +7,9 @@ pkgdesc='Native personal security suite with malware, integrity, DNS and browser
 arch=('x86_64')
 url='https://github.com/paarthbhatt/epimetheus-blue'
 license=('MIT')
+# Rust's LLVM linker cannot consume GCC LTO-only bundled C archives (SQLite/ring).
+# Disable makepkg's injected GCC LTO; Cargo's release thin LTO remains enabled.
+options=('!lto')
 # eframe dlopens several display/OpenGL libraries. Keep these runtime
 # dependencies even when an ELF-only dependency scanner reports them unused.
 depends=(
@@ -24,7 +27,7 @@ depends=(
   'systemd'
 )
 # The locked Cranelift/Wasmtime dependencies require Rust 1.95 or newer.
-makedepends=('cargo>=1.95' 'pkgconf')
+makedepends=('rust>=1.95' 'pkgconf')
 checkdepends=('nodejs' 'desktop-file-utils')
 optdepends=(
   'clamav: optional clamd malware scanning'
@@ -43,10 +46,8 @@ backup=(
   'etc/brave/native-messaging-hosts/com.epimetheus.blue.json'
 )
 source=("${url}/releases/download/v${pkgver}/${pkgname}-${pkgver}-source.tar.gz")
-# RELEASE BLOCKER: the parent release session must replace this deliberately
-# failing, non-SKIP placeholder with the SHA-256 of the frozen source asset,
-# then regenerate .SRCINFO. Never publish this as a verified source checksum.
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+# Frozen source asset; never replace it after publishing this checksum.
+sha256sums=('05129bdae41c8da320752adeac9584c39e30a66376bca87ef8cc9f525afb493b')
 
 prepare() {
   cd "$srcdir/$pkgname-$pkgver"
