@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod model;
 pub mod quarantine;
+pub mod triage;
 pub mod verdict;
 
 pub use config::Config;
@@ -16,6 +17,10 @@ pub use model::{
     ReputationRecord, Tier,
 };
 pub use quarantine::{Quarantine, StoredItem};
+pub use triage::{
+    assess_finding, FindingGroup, FindingReview, ReviewClassification, ReviewedFinding,
+    TriageSummary, TRIAGE_POLICY_VERSION,
+};
 pub use verdict::{classify, escalate_if_confirmed, reason};
 
 use anyhow::{Context, Result};
