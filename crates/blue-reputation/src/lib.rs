@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 const VIRUSTOTAL_SOURCE: &str = "virustotal";
 const VIRUSTOTAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,6 +27,7 @@ const MIN_SOURCE_HASHES: usize = 100;
 const MAX_SOURCE_NAME_BYTES: usize = 128;
 const UNIQUE_PATH_ATTEMPTS: usize = 128;
 const MILLIS_PER_HOUR: u64 = 60 * 60 * 1_000;
+const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 static UNIQUE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -113,27 +114,52 @@ struct LocalIndex {
     source_count: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct LocalFileStamp {
+    path: PathBuf,
+    size: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+struct LocalRefresh {
+    checked: Instant,
+    files: Vec<LocalFileStamp>,
+}
+
 pub struct ReputationEngine {
     db: Arc<Db>,
     cfg: ReputationConfig,
     local: RwLock<LocalIndex>,
     operation_lock: Mutex<()>,
+    refresh: Mutex<LocalRefresh>,
 }
 
 impl ReputationEngine {
     pub fn new(db: Arc<Db>, cfg: ReputationConfig) -> Result<Self> {
         validate_config(&cfg)?;
+        std::fs::create_dir_all(&cfg.local_dir)?;
+        let files = local_file_stamps(&cfg.local_dir)?;
         let local = load_local_index(&cfg.local_dir)?;
+        if files != local_file_stamps(&cfg.local_dir)? {
+            bail!("local sources changed during initial load");
+        }
         Ok(Self {
             db,
             cfg,
             local: RwLock::new(local),
             operation_lock: Mutex::new(()),
+            refresh: Mutex::new(LocalRefresh {
+                checked: Instant::now(),
+                files,
+            }),
         })
     }
 
     pub fn check_hash(&self, sha256: &str, online: bool) -> Result<ReputationResult> {
         let sha256 = canonical_sha256(sha256)?;
+        self.refresh_local_if_due(Instant::now());
         let local_match = self.local_read().hashes.get(&sha256).cloned();
 
         // A known local IOC needs no network corroboration and survives outages.
@@ -287,9 +313,69 @@ impl ReputationEngine {
     }
 
     fn reload_local(&self) -> Result<()> {
+        let files = local_file_stamps(&self.cfg.local_dir)?;
         let new_index = load_local_index(&self.cfg.local_dir)?;
+        if files != local_file_stamps(&self.cfg.local_dir)? {
+            bail!("local sources changed during reload");
+        }
         *self.local_write() = new_index;
+        if let Ok(mut refresh) = self.refresh.try_lock() {
+            refresh.files = files;
+            refresh.checked = Instant::now();
+        }
         Ok(())
+    }
+
+    /// Hot lookups avoid filesystem/DB work until this monotonic deadline.
+    fn refresh_local_if_due(&self, now: Instant) {
+        let Ok(mut refresh) = self.refresh.try_lock() else {
+            return;
+        };
+        if now.saturating_duration_since(refresh.checked) < LOCAL_REFRESH_INTERVAL {
+            return;
+        }
+        // Never wait behind an activation/rollback while holding refresh state.
+        let Ok(_operation) = self.operation_lock.try_lock() else {
+            return;
+        };
+        refresh.checked = now;
+        self.refresh_local_checked(&mut refresh);
+    }
+
+    fn refresh_local_checked(&self, refresh: &mut LocalRefresh) {
+        let result = (|| -> Result<()> {
+            let files = local_file_stamps(&self.cfg.local_dir)?;
+            if files == refresh.files {
+                return Ok(());
+            }
+            for previous in &refresh.files {
+                if let Ok(metadata) = std::fs::symlink_metadata(&previous.path) {
+                    if !metadata.is_file() {
+                        bail!("previous local source is no longer a regular file");
+                    }
+                }
+            }
+            let index = load_local_index(&self.cfg.local_dir)?;
+            if files != local_file_stamps(&self.cfg.local_dir)? {
+                bail!("local sources changed during reload");
+            }
+            *self.local_write() = index;
+            refresh.files = files;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let payload = serde_json::json!({
+                "status": "degraded", "retained_last_good": true,
+                "reason": format!("{error:#}"),
+            });
+            let _ = self.db.event(
+                "reputation.local",
+                "warn",
+                None,
+                &payload.to_string(),
+                now_ms(),
+            );
+        }
     }
 
     fn check_virustotal(&self, sha256: &str) -> Result<ReputationRecord> {
@@ -410,6 +496,42 @@ fn trim_ascii_start(mut value: &[u8]) -> &[u8] {
     value
 }
 
+fn local_file_stamp(path: PathBuf, metadata: &std::fs::Metadata) -> LocalFileStamp {
+    LocalFileStamp {
+        path,
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        identity: {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        },
+    }
+}
+
+fn local_file_stamps(directory: &Path) -> Result<Vec<LocalFileStamp>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !is_hash_list_path(&path) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file() {
+            continue;
+        }
+        files.push(local_file_stamp(path, &metadata));
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
 fn load_local_index(directory: &Path) -> Result<LocalIndex> {
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating hash source directory {}", directory.display()))?;
@@ -438,11 +560,22 @@ fn load_local_index(directory: &Path) -> Result<LocalIndex> {
     let mut sources = BTreeSet::new();
     for path in paths {
         let source = source_name(&path);
-        let mut file = open_regular_nofollow(&path)?;
+        let file = open_regular_nofollow(&path)?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        file.take((MAX_DOWNLOAD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
             .with_context(|| format!("reading local hash source {}", path.display()))?;
-        for hash in parse_hashes(&bytes) {
+        if bytes.len() > MAX_DOWNLOAD_BYTES {
+            bail!("local hash source exceeds 16 MiB limit");
+        }
+        let hashes = parse_hashes(&bytes);
+        if hashes.is_empty() {
+            bail!(
+                "local hash source {} has no valid SHA-256 hashes",
+                path.display()
+            );
+        }
+        for hash in hashes {
             index.hashes.entry(hash).or_insert_with(|| source.clone());
         }
         sources.insert(source);
@@ -918,6 +1051,91 @@ mod tests {
         ] {
             assert!(engine.check_hash(&malformed, false).is_err());
         }
+    }
+
+    fn refresh_due(engine: &ReputationEngine) {
+        let next = engine.refresh.lock().unwrap().checked + LOCAL_REFRESH_INTERVAL;
+        engine.refresh_local_if_due(next);
+    }
+
+    fn matches_local(engine: &ReputationEngine, number: u64) -> bool {
+        engine
+            .check_hash(&hash(number), false)
+            .unwrap()
+            .local_match
+            .is_some()
+    }
+
+    #[test]
+    fn separate_engine_observes_activation_and_rollback() {
+        let (_directory, db, updater) = fixture(false);
+        updater.activate_text("community", &source_text(0)).unwrap();
+        let reader = ReputationEngine::new(db, updater.cfg.clone()).unwrap();
+        updater
+            .activate_text("community", &source_text(1000))
+            .unwrap();
+        assert!(!matches_local(&reader, 1000));
+        refresh_due(&reader);
+        assert!(matches_local(&reader, 1000));
+        updater.rollback("community").unwrap();
+        refresh_due(&reader);
+        assert!(matches_local(&reader, 0));
+        assert!(!matches_local(&reader, 1000));
+    }
+
+    #[test]
+    fn invalid_external_update_retains_last_good_and_valid_update_recovers() {
+        let (_directory, db, updater) = fixture(false);
+        updater.activate_text("community", &source_text(0)).unwrap();
+        let reader = ReputationEngine::new(db.clone(), updater.cfg.clone()).unwrap();
+        let staged = updater.cfg.local_dir.join("invalid-stage");
+        std::fs::write(&staged, b"not a hash source").unwrap();
+        std::fs::rename(&staged, updater.cfg.local_dir.join("community.txt")).unwrap();
+        refresh_due(&reader);
+        assert!(matches_local(&reader, 0));
+        assert_eq!(reader.status().local_hashes, MIN_SOURCE_HASHES);
+        assert!(db
+            .recent_events(10)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "reputation.local"));
+        updater
+            .activate_text("community", &source_text(2000))
+            .unwrap();
+        refresh_due(&reader);
+        assert!(matches_local(&reader, 2000));
+    }
+
+    #[test]
+    fn unchanged_sources_and_hot_lookups_do_not_reparse() {
+        let (_directory, _db, engine) = fixture(false);
+        engine.activate_text("community", &source_text(0)).unwrap();
+        // A test-only marker disappears if the unchanged index is rebuilt.
+        engine
+            .local_write()
+            .hashes
+            .insert(hash(9000), "sentinel".into());
+        refresh_due(&engine);
+        assert_eq!(
+            engine
+                .check_hash(&hash(9000), false)
+                .unwrap()
+                .local_match
+                .as_deref(),
+            Some("sentinel")
+        );
+        let checked = engine.refresh.lock().unwrap().checked;
+        std::fs::write(
+            engine.cfg.local_dir.join("community.txt"),
+            b"invalid update",
+        )
+        .unwrap();
+        for _ in 0..10 {
+            assert!(matches_local(&engine, 0));
+        }
+        assert_eq!(engine.refresh.lock().unwrap().checked, checked);
+        refresh_due(&engine);
+        assert!(matches_local(&engine, 0));
     }
 
     #[test]
