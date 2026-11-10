@@ -7,58 +7,113 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <header>
-    <div class="shield">✓</div>
-    <div><small>EPIMETHEUS</small><h1>Blue Search Guard</h1></div>
-    <span id="state-dot" class="dot"></span>
+  <header class="brand">
+    <svg class="shield" viewBox="0 0 36 40" fill="none" aria-hidden="true">
+      <path d="M18 2 33 8v12c0 8-7 14-15 18C10 34 3 28 3 20V8L18 2Z" fill="currentColor"/>
+      <path d="m18 8 10 4v8c0 5-4 10-10 13-6-3-10-8-10-13v-8l10-4Z" stroke="#EFF3FF" stroke-width="1.5"/>
+      <path d="m18 14 5 2v4c0 3-2 5-5 7-3-2-5-4-5-7v-4l5-2Z" fill="#101A35"/>
+    </svg>
+    <div><p class="brand-name">Epimetheus Blue</p><h1>Search Guard</h1></div>
   </header>
 
-  <form id="search-form" class="search">
-    <input id="search-query" type="search" placeholder="Search privately…" autocomplete="off">
-    <button type="submit" aria-label="Search">⌕</button>
-  </form>
-  <select id="search-provider" aria-label="Search provider">
-    <option value="duckduckgo">DuckDuckGo</option>
-    <option value="brave">Brave Search</option>
-    <option value="google">Google</option>
-    <option value="bing">Bing</option>
-  </select>
-
   <main>
-    <label class="master"><span><b>Protection</b><em id="protection-label">Active</em></span><input id="enabled" type="checkbox"><i></i></label>
-    <section>
-      <label><span>Remove sponsored results</span><input id="cleanSponsored" type="checkbox"><i></i></label>
-      <label><span>Strip tracking parameters</span><input id="stripTracking" type="checkbox"><i></i></label>
-      <label><span>Warn on blocked links</span><input id="warnBlocked" type="checkbox"><i></i></label>
-      <label><span>Strict safe search</span><input id="safeSearch" type="checkbox"><i></i></label>
+    <section class="site-workspace" aria-labelledby="site-heading">
+      <div class="section-heading">
+        <h2 id="site-heading">Current site</h2>
+        <span id="site-rule" class="rule-state" role="status">Reading rule…</span>
+      </div>
+      <p id="site-domain" class="domain">Reading current tab…</p>
+      <div class="site-actions" role="group" aria-label="Saved rule for the current site">
+        <button id="allow-site" type="button" aria-pressed="false" disabled>Allow site</button>
+        <button id="block-site" type="button" class="danger" aria-pressed="false" disabled>Block site</button>
+      </div>
+      <p id="site-detail" class="supporting">Rules stay in this browser profile. Allowing a site does not override desktop DNS.</p>
+
+      <label class="toggle-row master">
+        <span class="toggle-copy">
+          <span id="protection-title" class="toggle-title">Browser protection</span>
+          <span class="control-state"><span id="state-dot" class="dot off" aria-hidden="true"></span><span id="protection-label" role="status">Loading settings…</span></span>
+        </span>
+        <input id="enabled" type="checkbox" role="switch" aria-labelledby="protection-title" aria-describedby="protection-detail" disabled>
+      </label>
+      <p id="protection-detail" class="supporting">This control enables or pauses browser filtering and search-page cleanup.</p>
+      <p id="popup-message" class="feedback" role="status" aria-live="polite" hidden></p>
     </section>
 
-    <div class="desktop">
-      <div class="desktop-heading">
-        <span>Desktop: <b id="desktop-state">Checking…</b></span>
-        <button id="refresh-native" type="button">Refresh</button>
-      </div>
-      <div class="native-counts">
-        <span><b id="native-artifacts">—</b> artifacts</span>
-        <span><b id="native-findings">—</b> findings</span>
-        <span><b id="native-quarantined">—</b> quarantined</span>
-        <span><b id="native-blocked">—</b> DNS blocks</span>
-      </div>
-      <p id="desktop-detail">Waiting for the local app</p>
-    </div>
+    <section class="activity workspace-section" aria-labelledby="activity-heading">
+      <h2 id="activity-heading">This page</h2>
+      <p id="page-detail" class="supporting" aria-live="polite">Checking for a search-page snapshot…</p>
+      <dl id="page-stats" class="stats" hidden>
+        <div><dt>Ads hidden</dt><dd id="removed">—</dd></div>
+        <div><dt>Links cleaned</dt><dd id="cleaned">—</dd></div>
+        <div><dt>Link warnings</dt><dd id="warned">—</dd></div>
+      </dl>
+    </section>
 
-    <div class="stats">
-      <div><b id="removed">—</b><span>ads hidden</span></div>
-      <div><b id="cleaned">—</b><span>links cleaned</span></div>
-      <div><b id="warned">—</b><span>warnings</span></div>
-    </div>
+    <section class="search-workspace workspace-section" aria-labelledby="search-heading">
+      <h2 id="search-heading">Search with Blue</h2>
+      <form id="search-form" class="search">
+        <label class="visually-hidden" for="search-query">Search query</label>
+        <input id="search-query" type="search" placeholder="Enter a search query" autocomplete="off" spellcheck="false" disabled>
+        <button id="search-submit" type="submit" disabled>Search</button>
+      </form>
+      <div class="provider-row">
+        <label for="search-provider">Provider</label>
+        <select id="search-provider" disabled>
+          <option value="duckduckgo">DuckDuckGo</option>
+          <option value="brave">Brave Search</option>
+          <option value="google">Google</option>
+          <option value="bing">Bing</option>
+        </select>
+      </div>
+      <p class="supporting">Opens your chosen provider. Its privacy policy applies.</p>
+      <p id="search-message" class="feedback" role="status" aria-live="polite" hidden></p>
+    </section>
 
-    <div class="site">
-      <span id="site-domain">No website selected</span>
-      <div><button id="allow-site" type="button">Allow</button><button id="block-site" type="button" class="danger">Block</button></div>
-    </div>
+    <details class="preferences workspace-section">
+      <summary>Search preferences</summary>
+      <div class="preference-rows">
+        <label class="toggle-row">
+          <span class="toggle-copy"><span class="toggle-title">Remove sponsored results</span><span id="sponsored-detail" class="supporting">Identified ads on supported search pages.</span></span>
+          <input id="cleanSponsored" type="checkbox" role="switch" aria-describedby="sponsored-detail" disabled>
+        </label>
+        <label class="toggle-row">
+          <span class="toggle-copy"><span class="toggle-title">Strip tracking parameters</span><span id="tracking-detail" class="supporting">Common campaign parameters in result links.</span></span>
+          <input id="stripTracking" type="checkbox" role="switch" aria-describedby="tracking-detail" disabled>
+        </label>
+        <label class="toggle-row">
+          <span class="toggle-copy"><span class="toggle-title">Warn on blocked links</span><span id="warning-detail" class="supporting">List matches are not infection findings.</span></span>
+          <input id="warnBlocked" type="checkbox" role="switch" aria-describedby="warning-detail" disabled>
+        </label>
+        <label class="toggle-row">
+          <span class="toggle-copy"><span class="toggle-title">Strict SafeSearch</span><span id="safe-search-detail" class="supporting">Requests your provider's filter for Blue searches.</span></span>
+          <input id="safeSearch" type="checkbox" role="switch" aria-describedby="safe-search-detail" disabled>
+        </label>
+        <p id="preferences-message" class="feedback" role="status" aria-live="polite" hidden></p>
+      </div>
+    </details>
+
+    <section class="desktop workspace-section" aria-labelledby="bridge-heading">
+      <div class="section-heading">
+        <h2 id="bridge-heading">Read-only desktop bridge</h2>
+        <button id="refresh-native" type="button" class="quiet-button">Check again</button>
+      </div>
+      <p class="bridge-state" role="status">Desktop: <b id="desktop-state">Checking bridge…</b></p>
+      <p id="desktop-detail" class="supporting">One local check when this popup opens; further checks are manual.</p>
+      <p class="bridge-boundary">Cannot change desktop files, feeds, settings, DNS or firewall policy. A reply does not verify an open desktop window or active protection.</p>
+      <details id="desktop-records" class="desktop-records" hidden>
+        <summary>Desktop records snapshot</summary>
+        <dl class="native-counts">
+          <div><dt>Artifacts</dt><dd id="native-artifacts">—</dd></div>
+          <div><dt>Groups needing attention</dt><dd id="native-findings">—</dd></div>
+          <div><dt>Quarantined</dt><dd id="native-quarantined">—</dd></div>
+          <div><dt>DNS block records</dt><dd id="native-blocked">—</dd></div>
+        </dl>
+        <p class="supporting">Automatic assessment groups observations; original evidence is retained. These totals are not this page's activity or a live check.</p>
+      </details>
+    </section>
   </main>
-  <footer>Local settings · no analytics · no remote code</footer>
+  <footer>Browser settings stay in this profile. Full desktop feeds are not copied into browser request rules.</footer>
   <script src="popup.js"></script>
 </body>
 </html>

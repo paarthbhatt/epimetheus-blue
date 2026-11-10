@@ -1,0 +1,11 @@
+mod browser;
+mod cleanup;
+mod feeds;
+mod firewall;
+mod integrity;
+mod network;
+mod overview;
+mod quarantine;
+mod reputation;
+mod scanner;
+mod settings;

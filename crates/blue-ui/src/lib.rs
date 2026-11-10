@@ -3,29 +3,23 @@
 //! This is an actual Wayland/X11 application built with egui/eframe. There is
 //! no web server, browser shell, Electron runtime, or embedded web view.
 
+mod pages;
+mod shell;
+mod theme;
+mod visuals;
+
 use anyhow::{Context, Result};
-use blue_core::{Config, Counts, Dataset, Db, Event, Finding, Quarantine, Quarantined, Tier};
+use blue_core::{Config, Counts, Dataset, Db, Event, Quarantine, Quarantined, Tier};
 use blue_feeds::{Feeds, FeedsConfig, SyncReport};
 use blue_guard::{Guard, GuardConfig, GuardReport};
 use blue_scan::{ScanConfig, ScanEngine};
-use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Frame, Layout, RichText, Stroke, Vec2,
-};
+use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Frame, RichText, Stroke, Vec2};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-const BG: Color32 = Color32::from_rgb(8, 13, 23);
-const PANEL: Color32 = Color32::from_rgb(14, 22, 36);
-const PANEL_HOVER: Color32 = Color32::from_rgb(20, 31, 49);
-const BORDER: Color32 = Color32::from_rgb(37, 51, 72);
-const TEXT: Color32 = Color32::from_rgb(229, 235, 244);
-const MUTED: Color32 = Color32::from_rgb(139, 153, 175);
-const GREEN: Color32 = Color32::from_rgb(62, 207, 142);
-const AMBER: Color32 = Color32::from_rgb(245, 178, 67);
-const RED: Color32 = Color32::from_rgb(244, 95, 105);
-const BLUE: Color32 = Color32::from_rgb(88, 166, 255);
+use theme::{AMBER, BG, BLUE, BORDER, GREEN, MUTED, PANEL, PANEL_HOVER, RED, TEXT};
 
 #[derive(Clone)]
 pub struct AppDeps {
@@ -36,7 +30,10 @@ pub struct AppDeps {
 
 /// Open the native control center and block until its window closes.
 pub fn run(deps: AppDeps) -> Result<()> {
+    let renderer = preferred_renderer(std::env::var("BLUE_RENDERER").ok().as_deref());
+    let can_retry_with_glow = matches!(renderer, eframe::Renderer::Wgpu);
     let options = eframe::NativeOptions {
+        renderer,
         viewport: egui::ViewportBuilder::default()
             .with_title("Epimetheus Blue")
             .with_app_id("epimetheus-blue")
@@ -45,15 +42,55 @@ pub fn run(deps: AppDeps) -> Result<()> {
             .with_min_inner_size([900.0, 620.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    match eframe::run_native(
         "Epimetheus Blue",
         options,
         Box::new(move |cc| Ok(Box::new(BlueApp::new(cc, deps)))),
-    )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if can_retry_with_glow => {
+            // winit cannot create a second event loop in this process. The child
+            // selects Glow, so a compatibility failure cannot restart again.
+            eprintln!(
+                "Epimetheus Blue: wgpu failed ({error}); trying the OpenGL compatibility renderer."
+            );
+            let executable = std::env::current_exe()
+                .with_context(|| format!("locating the executable after wgpu failed: {error}"))?;
+            let status = glow_compatibility_command(&executable, std::env::args_os().skip(1))
+                .spawn()
+                .with_context(|| {
+                    format!("starting OpenGL compatibility after wgpu failed: {error}")
+                })?
+                .wait()
+                .context("waiting for the OpenGL compatibility window")?;
+            anyhow::ensure!(
+                status.success(),
+                "OpenGL compatibility exited with {status}; wgpu failed: {error}"
+            );
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!(error.to_string())),
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn preferred_renderer(preference: Option<&str>) -> eframe::Renderer {
+    if preference.is_some_and(|value| value.eq_ignore_ascii_case("glow")) {
+        eframe::Renderer::Glow
+    } else {
+        eframe::Renderer::Wgpu
+    }
+}
+
+fn glow_compatibility_command(
+    executable: &Path,
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command.args(arguments).env("BLUE_RENDERER", "glow");
+    command
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Page {
     Overview,
     Scanner,
@@ -71,17 +108,18 @@ enum Page {
 struct Snapshot {
     counts: Counts,
     events: Vec<Event>,
-    findings: Vec<Finding>,
+    finding_groups: Vec<blue_core::FindingGroup>,
     quarantine: Vec<Quarantined>,
     datasets: Vec<Dataset>,
 }
 
 impl Snapshot {
     fn load(db: &Db) -> Result<Snapshot> {
+        let finding_groups = db.list_finding_groups(250, true)?;
         Ok(Snapshot {
             counts: db.counts()?,
             events: db.recent_events(60)?,
-            findings: db.list_findings(250, false)?,
+            finding_groups,
             quarantine: db.list_quarantine(false)?,
             datasets: db.list_datasets()?,
         })
@@ -91,7 +129,7 @@ impl Snapshot {
         Snapshot {
             counts: Counts::default(),
             events: Vec::new(),
-            findings: Vec::new(),
+            finding_groups: Vec::new(),
             quarantine: Vec::new(),
             datasets: Vec::new(),
         }
@@ -127,10 +165,13 @@ struct ScanSummary {
     candidates: usize,
     threats: usize,
     quarantined: usize,
+    containment_failures: usize,
     errors: usize,
 }
 
 struct BlueApp {
+    reduced_motion: bool,
+    guardian: visuals::Shield,
     deps: AppDeps,
     page: Page,
     snapshot: Snapshot,
@@ -156,6 +197,8 @@ struct BlueApp {
     reputation_path: String,
     reputation_online: bool,
     cleanup_report: Option<blue_cleanup::CleanupReport>,
+    last_cleanup_apply: Option<blue_cleanup::ApplyReport>,
+    cleanup_apply_error: Option<String>,
     cleanup_performance: Option<blue_cleanup::PerformanceSnapshot>,
     cleanup_selected: HashSet<String>,
     cleanup_confirmation: String,
@@ -181,7 +224,9 @@ struct BlueApp {
 
 impl BlueApp {
     fn new(cc: &eframe::CreationContext<'_>, deps: AppDeps) -> BlueApp {
-        configure_style(&cc.egui_ctx);
+        let reduced_motion =
+            std::env::var("BLUE_REDUCED_MOTION").is_ok_and(|value| value == "1" || value == "true");
+        theme::apply(&cc.egui_ctx, reduced_motion);
         let (tx, rx) = mpsc::channel();
         let scan_path = deps
             .config
@@ -191,7 +236,13 @@ impl BlueApp {
             .unwrap_or_else(|| PathBuf::from("."))
             .to_string_lossy()
             .into_owned();
-        let snapshot = Snapshot::load(&deps.db).unwrap_or_else(|_| Snapshot::empty());
+        let (snapshot, refresh_error) = match Snapshot::load(&deps.db) {
+            Ok(snapshot) => (snapshot, None),
+            Err(error) => (
+                Snapshot::empty(),
+                Some(format!("Status unavailable: {error}")),
+            ),
+        };
         let watch_unit_installed = user_unit_exists("blue-watch.service");
         let guard_unit_installed = user_unit_exists("blue-guard.timer");
         let feed_unit_installed = user_unit_exists("blue-feeds.timer");
@@ -201,11 +252,13 @@ impl BlueApp {
         let dns_routed = system_dns_uses_loopback();
         let reputation_path = scan_path.clone();
         BlueApp {
+            reduced_motion,
+            guardian: visuals::Shield::new(cc),
             deps,
             page: Page::Overview,
             snapshot,
             last_refresh: Instant::now(),
-            refresh_error: None,
+            refresh_error,
             tx,
             rx,
             jobs: HashSet::new(),
@@ -230,6 +283,8 @@ impl BlueApp {
             reputation_path,
             reputation_online: false,
             cleanup_report: None,
+            last_cleanup_apply: None,
+            cleanup_apply_error: None,
             cleanup_performance: None,
             cleanup_selected: HashSet::new(),
             cleanup_confirmation: String::new(),
@@ -263,7 +318,7 @@ impl BlueApp {
             }
             Err(error) => self.refresh_error = Some(error.to_string()),
         }
-        if self.last_service_refresh.elapsed() > Duration::from_secs(15) {
+        if self.last_service_refresh.elapsed() > Duration::from_secs(30) {
             self.dns_routed = system_dns_uses_loopback();
             if self.watch_unit_installed {
                 self.realtime = user_unit_active("blue-watch.service");
@@ -297,10 +352,10 @@ impl BlueApp {
                         Ok(summary) => {
                             self.message = Some((
                                 format!(
-                                    "Scan complete: {} files, {} threat(s), {} quarantined",
-                                    summary.files, summary.threats, summary.quarantined
+                                    "Scan complete: {} files, {} T2+ detections, {} quarantined, {} containment failures",
+                                    summary.files, summary.threats, summary.quarantined, summary.containment_failures
                                 ),
-                                true,
+                                summary.containment_failures == 0 && summary.errors == 0,
                             ));
                             self.last_scan = Some(summary);
                         }
@@ -400,13 +455,7 @@ impl BlueApp {
                     self.jobs.remove("cleanup-scan");
                     match result {
                         Ok((report, performance)) => {
-                            let candidate_ids = report
-                                .candidates
-                                .iter()
-                                .map(|candidate| candidate.id.clone())
-                                .collect::<HashSet<_>>();
-                            self.cleanup_selected
-                                .retain(|id| candidate_ids.contains(id));
+                            self.cleanup_selected.clear();
                             self.cleanup_report = Some(report);
                             self.cleanup_performance = Some(performance);
                             self.cleanup_confirmation.clear();
@@ -436,11 +485,17 @@ impl BlueApp {
                                 ),
                                 failed == 0,
                             ));
+                            self.last_cleanup_apply = Some(report);
                             self.cleanup_selected.clear();
                             self.cleanup_confirmation.clear();
-                            self.run_cleanup_scan();
+                            if succeeded > 0 {
+                                self.run_cleanup_scan();
+                            }
                         }
-                        Err(error) => self.message = Some((error, false)),
+                        Err(error) => {
+                            self.cleanup_apply_error = Some(error.clone());
+                            self.message = Some((error, false));
+                        }
                     }
                 }
                 JobResult::Feeds(result) => {
@@ -616,9 +671,13 @@ impl BlueApp {
     }
 
     fn run_cleanup_scan(&mut self) {
+        if self.jobs.contains("cleanup-apply") {
+            return;
+        }
         if !self.jobs.insert("cleanup-scan") {
             return;
         }
+        self.cleanup_confirmation.clear();
         let engine = self.cleanup_engine();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -633,9 +692,25 @@ impl BlueApp {
     }
 
     fn apply_cleanup(&mut self) {
+        if self.jobs.contains("cleanup-scan") {
+            self.message = Some((
+                "Wait for storage analysis to finish before approving deletion.".into(),
+                false,
+            ));
+            return;
+        }
         if !self.jobs.insert("cleanup-apply") {
             return;
         }
+        self.last_cleanup_apply = None;
+        self.cleanup_apply_error = None;
+        self.message = Some((
+            format!(
+                "Revalidating {} explicitly approved cleanup candidates…",
+                self.cleanup_selected.len()
+            ),
+            true,
+        ));
         let ids = self.cleanup_selected.iter().cloned().collect::<Vec<_>>();
         let confirmation = self.cleanup_confirmation.clone();
         let engine = self.cleanup_engine();
@@ -864,1386 +939,30 @@ impl BlueApp {
     }
 
     fn sidebar(&mut self, root: &mut egui::Ui) {
-        egui::Panel::left("sidebar")
-            .exact_size(218.0)
-            .frame(
-                Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::same(18)),
-            )
-            .show(root, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    shield(ui, 32.0, GREEN);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("EPIMETHEUS").size(11.0).color(MUTED).strong());
-                        ui.label(RichText::new("BLUE").size(20.0).color(TEXT).strong());
-                    });
-                });
-                ui.add_space(26.0);
-                for (page, icon, name) in [
-                    (Page::Overview, "◈", "Overview"),
-                    (Page::Scanner, "⌕", "Scanner"),
-                    (Page::Integrity, "⌁", "Integrity"),
-                    (Page::Network, "⇄", "Network"),
-                    (Page::Firewall, "▣", "Firewall"),
-                    (Page::Reputation, "#", "Reputation"),
-                    (Page::Cleanup, "◫", "Cleanup"),
-                    (Page::Quarantine, "◇", "Quarantine"),
-                    (Page::Filters, "≋", "Filters"),
-                    (Page::Browser, "◎", "Browser Shield"),
-                    (Page::Settings, "⚙", "Settings"),
-                ] {
-                    let selected = self.page == page;
-                    let response = ui.add_sized(
-                        [182.0, 38.0],
-                        egui::Button::new(
-                            RichText::new(format!("  {icon}   {name}"))
-                                .size(14.0)
-                                .color(if selected { TEXT } else { MUTED }),
-                        )
-                        .fill(if selected {
-                            PANEL_HOVER
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .stroke(if selected {
-                            Stroke::new(1.0, BORDER)
-                        } else {
-                            Stroke::NONE
-                        })
-                        .corner_radius(8.0),
-                    );
-                    if response.clicked() {
-                        self.page = page;
-                    }
-                    ui.add_space(3.0);
-                }
-
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    let paused = self.deps.db.kill_switch();
-                    ui.label(
-                        RichText::new(if paused {
-                            "● ACTIONS PAUSED"
-                        } else {
-                            "● SYSTEM READY"
-                        })
-                        .size(11.0)
-                        .color(if paused { AMBER } else { GREEN }),
-                    );
-                    ui.add_space(8.0);
-                    ui.separator();
-                });
-            });
+        shell::sidebar(self, root);
     }
 
     fn header(&mut self, ui: &mut egui::Ui, title: &str, subtitle: &str) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(title).size(26.0).strong().color(TEXT));
-                ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let paused = self.deps.db.kill_switch();
-                if ui
-                    .add(
-                        egui::Button::new(if paused {
-                            "Resume actions"
-                        } else {
-                            "Emergency pause"
-                        })
-                        .fill(if paused {
-                            GREEN
-                        } else {
-                            Color32::from_rgb(64, 30, 36)
-                        })
-                        .stroke(Stroke::new(1.0, if paused { GREEN } else { RED }))
-                        .corner_radius(8.0),
-                    )
-                    .on_hover_text("Pauses automatic file quarantine only; firewall and system DNS are not changed.")
-                    .clicked()
-                {
-                    self.toggle_kill_switch();
-                }
-            });
-        });
-        ui.add_space(18.0);
-        if let Some((message, good)) = &self.message {
-            Frame::new()
-                .fill(if *good {
-                    Color32::from_rgb(14, 48, 40)
-                } else {
-                    Color32::from_rgb(57, 30, 35)
-                })
-                .stroke(Stroke::new(1.0, if *good { GREEN } else { RED }))
-                .corner_radius(8.0)
-                .inner_margin(egui::Margin::symmetric(12, 9))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(message).color(TEXT));
-                });
-            ui.add_space(12.0);
-        }
-    }
-
-    fn overview(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Security overview",
-            "One honest view of what is protected and what needs attention.",
-        );
-        let clamd_socket = blue_core::config::expand_tilde(&self.deps.config.scan.clamav.socket);
-        if !clamd_socket.exists() {
-            Frame::new()
-                .fill(Color32::from_rgb(54, 40, 17))
-                .stroke(Stroke::new(1.0, AMBER))
-                .corner_radius(8.0)
-                .inner_margin(egui::Margin::symmetric(12, 9))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "DEGRADED · ClamAV is unavailable; YARA-X protection remains active",
-                        )
-                        .color(AMBER)
-                        .strong(),
-                    );
-                });
-            ui.add_space(12.0);
-        }
-        ui.columns(4, |columns| {
-            stat_card(
-                &mut columns[0],
-                "FILES SCANNED",
-                self.snapshot.counts.artifacts,
-                BLUE,
-            );
-            stat_card(
-                &mut columns[1],
-                "ACTIVE FINDINGS",
-                self.snapshot.counts.findings,
-                AMBER,
-            );
-            stat_card(
-                &mut columns[2],
-                "QUARANTINED",
-                self.snapshot.counts.quarantined,
-                RED,
-            );
-            let blocked = self.snapshot.counts.blocked + self.dns_stats.snapshot().blocked as i64;
-            stat_card(&mut columns[3], "BLOCKED REQUESTS", blocked, GREEN);
-        });
-        ui.add_space(18.0);
-        ui.columns(2, |columns| {
-            surface(&mut columns[0], |ui| {
-                section_title(
-                    ui,
-                    "Protection controls",
-                    "Services run only while enabled.",
-                );
-                ui.add_space(12.0);
-                if protection_row(
-                    ui,
-                    "Realtime file protection",
-                    "Watch configured folders and scan changed files",
-                    &mut self.realtime,
-                ) {
-                    self.toggle_realtime(self.realtime);
-                }
-                ui.separator();
-                if protection_row(
-                    ui,
-                    "DNS ad & malware shield",
-                    if self.dns_routed {
-                        "System DNS is routed through the local shield"
-                    } else {
-                        "Local resolver only — system DNS setup is not enabled"
-                    },
-                    &mut self.dns,
-                ) {
-                    self.toggle_dns(self.dns);
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Integrity guard").strong().color(TEXT));
-                        ui.label(
-                            RichText::new("Check startup paths and sensitive files").color(MUTED),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                !self.jobs.contains("guard"),
-                                egui::Button::new("Run check"),
-                            )
-                            .clicked()
-                        {
-                            self.run_guard();
-                        }
-                    });
-                });
-            });
-            surface(&mut columns[1], |ui| {
-                section_title(
-                    ui,
-                    "Recent activity",
-                    "Latest security events on this device.",
-                );
-                ui.add_space(8.0);
-                if self.snapshot.events.is_empty() {
-                    empty_state(
-                        ui,
-                        "No activity yet",
-                        "Run a scan or integrity check to start the timeline.",
-                    );
-                } else {
-                    for event in self.snapshot.events.iter().take(7) {
-                        event_row(ui, event);
-                    }
-                }
-            });
-        });
-    }
-
-    fn scanner(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Scanner",
-            "Scan a file or folder. Nothing is deleted automatically.",
-        );
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Scan target",
-                "Paths are expanded locally; no file is uploaded.",
-            );
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let edit = egui::TextEdit::singleline(&mut self.scan_path)
-                    .hint_text("~/Downloads or /path/to/file")
-                    .desired_width(f32::INFINITY);
-                ui.add_sized([ui.available_width() - 122.0, 36.0], edit);
-                if ui
-                    .add_enabled(!self.jobs.contains("scan"), egui::Button::new("Scan now"))
-                    .clicked()
-                {
-                    self.start_scan();
-                }
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.small_button("Downloads").clicked() {
-                    self.scan_path = "~/Downloads".into();
-                }
-                if ui.small_button("Home").clicked() {
-                    self.scan_path = "~".into();
-                }
-                if self.jobs.contains("scan") {
-                    ui.spinner();
-                    ui.label(RichText::new("Scanning…").color(MUTED));
-                }
-            });
-        });
-        ui.add_space(18.0);
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Last result",
-                "Verdicts remain tiered: observed, candidate, corroborated, confirmed.",
-            );
-            ui.add_space(12.0);
-            match &self.last_scan {
-                Some(s) => {
-                    ui.columns(5, |c| {
-                        mini_stat(&mut c[0], "Files", s.files);
-                        mini_stat(&mut c[1], "Candidates", s.candidates);
-                        mini_stat(&mut c[2], "Threats", s.threats);
-                        mini_stat(&mut c[3], "Quarantined", s.quarantined);
-                        mini_stat(&mut c[4], "Errors", s.errors);
-                    });
-                }
-                None => empty_state(
-                    ui,
-                    "No scan in this session",
-                    "Choose a target and select Scan now.",
-                ),
-            }
-        });
-    }
-
-    fn integrity(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Integrity guard",
-            "Detect changes to startup paths, shell files, SSH keys and system units.",
-        );
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.jobs.contains("guard"),
-                    egui::Button::new("Run integrity check"),
-                )
-                .clicked()
-            {
-                self.run_guard();
-            }
-            if self.jobs.contains("guard") {
-                ui.spinner();
-            }
-            if let Some(report) = &self.last_guard {
-                ui.label(
-                    RichText::new(if report.baseline {
-                        "Baseline established — this is not a clean bill of health"
-                    } else {
-                        "Compared with previous baseline"
-                    })
-                    .color(MUTED),
-                );
-            }
-        });
-        ui.add_space(16.0);
-        let findings = self.snapshot.findings.clone();
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Unreviewed findings",
-                "Every filesystem change is T1 until independently corroborated.",
-            );
-            ui.add_space(8.0);
-            if findings.is_empty() {
-                empty_state(
-                    ui,
-                    "No unreviewed changes",
-                    "Run a check to compare with the stored baseline.",
-                );
-            } else {
-                egui::ScrollArea::vertical()
-                    .max_height(470.0)
-                    .show(ui, |ui| {
-                        for finding in &findings {
-                            finding_row(ui, finding, |id| self.acknowledge(id));
-                        }
-                    });
-            }
-        });
-    }
-
-    fn firewall(&mut self, ui: &mut egui::Ui) {
-        self.header(ui, "Defender-style firewall", "Stateful inbound protection for Arch Linux; outgoing traffic and DNS remain unchanged.");
-        surface(ui, |ui| {
-            section_title(ui, "Protection state", &self.firewall_status.message);
-            if let Some(profile) = self.firewall_status.profile {
-                ui.label(format!("Reported profile: {profile:?}"));
-            }
-            ui.label(
-                RichText::new(if self.firewall_status.pending {
-                    "STAGED — automatically rolls back unless confirmed"
-                } else if self.firewall_status.active {
-                    "ACTIVE"
-                } else {
-                    "NOT ACTIVE"
-                })
-                .strong()
-                .color(if self.firewall_status.active {
-                    GREEN
-                } else {
-                    AMBER
-                }),
-            );
-            if !self.firewall_status.installed {
-                ui.label("Privileged helper is not installed. Planning is available; activation requires the separate installer.");
-                if ui.button("Copy firewall installer plan command").clicked() {
-                    let base = extension_path()
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
-                    let installed = base.join("firewall-install/scripts/install-firewall.sh");
-                    let script = if installed.exists() {
-                        installed
-                    } else {
-                        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                            .join("../../scripts/install-firewall.sh")
-                    };
-                    ui.ctx().copy_text(script_plan_command(&script));
-                }
-            }
-        });
-        ui.add_space(14.0);
-        self.firewall_editor(ui);
-        ui.add_space(14.0);
-        self.firewall_actions(ui);
-    }
-
-    fn firewall_editor(&mut self, ui: &mut egui::Ui) {
-        surface(ui, |ui| {
-            section_title(ui, "Draft policy", "New unsolicited inbound traffic is blocked. Existing connections, ICMP and DHCP are preserved.");
-            ui.horizontal(|ui| {
-                let public = ui.selectable_value(
-                    &mut self.firewall_policy.profile,
-                    blue_firewall::FirewallProfile::Public,
-                    "Public",
-                );
-                let private = ui.selectable_value(
-                    &mut self.firewall_policy.profile,
-                    blue_firewall::FirewallProfile::Private,
-                    "Private / LAN discovery",
-                );
-                if public.changed() || private.changed() {
-                    self.firewall_approval = false;
-                }
-            });
-            self.firewall_rule_editor(ui);
-            egui::CollapsingHeader::new("Inspect generated nftables policy").show(ui, |ui| {
-                match self.firewall_policy.render_nft() {
-                    Ok(policy) => {
-                        ui.code(policy);
-                    }
-                    Err(error) => {
-                        ui.colored_label(RED, error.to_string());
-                    }
-                }
-            });
-            ui.label(RichText::new("Only Blue's own inet table is managed. Forwarded Docker/VPN traffic is not governed by this baseline.").size(11.0).color(MUTED));
-        });
-    }
-
-    fn firewall_rule_editor(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Explicit inbound exceptions").strong());
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.firewall_rule_name)
-                    .hint_text("Name")
-                    .desired_width(150.0),
-            );
-            ui.checkbox(&mut self.firewall_rule_udp, "UDP (otherwise TCP)");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.firewall_rule_port)
-                    .hint_text("Port")
-                    .desired_width(60.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.firewall_rule_source)
-                    .hint_text("Optional source CIDR")
-                    .desired_width(180.0),
-            );
-            if ui.button("Add").clicked() {
-                self.add_firewall_rule();
-            }
-        });
-        let mut remove = None;
-        for (index, rule) in self.firewall_policy.inbound.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "{} · {:?}/{} · {}",
-                    rule.name,
-                    rule.protocol,
-                    rule.port,
-                    rule.source.as_deref().unwrap_or("any source")
-                ));
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(index);
-                }
-            });
-        }
-        if let Some(index) = remove {
-            self.firewall_policy.inbound.remove(index);
-            self.firewall_approval = false;
-        }
-    }
-
-    fn add_firewall_rule(&mut self) {
-        let Ok(port) = self.firewall_rule_port.parse::<u16>() else {
-            self.message = Some(("Enter a valid port from 1 to 65535".into(), false));
-            return;
-        };
-        let mut draft = self.firewall_policy.clone();
-        draft.inbound.push(blue_firewall::InboundRule {
-            name: self.firewall_rule_name.trim().to_owned(),
-            protocol: if self.firewall_rule_udp {
-                blue_firewall::Protocol::Udp
-            } else {
-                blue_firewall::Protocol::Tcp
-            },
-            port,
-            source: (!self.firewall_rule_source.trim().is_empty())
-                .then(|| self.firewall_rule_source.trim().to_owned()),
-        });
-        match draft.validate() {
-            Ok(()) => {
-                self.firewall_policy = draft;
-                self.firewall_approval = false;
-            }
-            Err(error) => self.message = Some((error.to_string(), false)),
-        }
-    }
-
-    fn firewall_actions(&mut self, ui: &mut egui::Ui) {
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Apply with automatic rollback",
-                "Administrator approval is required. Unconfirmed changes revert after 60 seconds.",
-            );
-            let ready = self.firewall_status.installed && !self.jobs.contains("firewall");
-            if self.firewall_status.pending {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Keep staged policy"))
-                        .clicked()
-                    {
-                        self.run_firewall("confirm");
-                    }
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Undo staged change now"))
-                        .clicked()
-                    {
-                        self.run_firewall("rollback");
-                    }
-                });
-            } else {
-                ui.checkbox(
-                    &mut self.firewall_approval,
-                    "I reviewed the policy and approve the selected firewall action",
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            ready && self.firewall_approval,
-                            egui::Button::new("Stage firewall policy"),
-                        )
-                        .clicked()
-                    {
-                        self.run_firewall("apply");
-                    }
-                    if ui
-                        .add_enabled(
-                            ready && self.firewall_approval && self.firewall_status.active,
-                            egui::Button::new("Disable Blue rules"),
-                        )
-                        .clicked()
-                    {
-                        self.run_firewall("disable");
-                    }
-                });
-            }
-        });
-    }
-
-    fn network(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Network observer",
-            "Read-only egress inventory. New does not mean malicious.",
-        );
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.jobs.contains("network"),
-                    egui::Button::new("Observe connections"),
-                )
-                .clicked()
-            {
-                self.run_network();
-            }
-            if self.jobs.contains("network") {
-                ui.spinner();
-            }
-            ui.label(
-                RichText::new("No firewall rules are changed by this component.").color(MUTED),
-            );
-        });
-        ui.add_space(16.0);
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Current public destinations",
-                "Private, loopback, multicast and link-local addresses are excluded by default.",
-            );
-            ui.add_space(8.0);
-            match &self.last_net {
-                None => empty_state(
-                    ui,
-                    "No observation in this session",
-                    "The first run creates a baseline and does not claim destinations are safe.",
-                ),
-                Some(report) if report.connections.is_empty() => empty_state(
-                    ui,
-                    "No public connections observed",
-                    "Only established TCP and connected UDP sockets are included.",
-                ),
-                Some(report) => {
-                    egui::ScrollArea::vertical()
-                        .max_height(490.0)
-                        .show(ui, |ui| {
-                            for connection in &report.connections {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(&connection.protocol).monospace().color(BLUE),
-                                    );
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            RichText::new(
-                                                connection
-                                                    .process
-                                                    .as_deref()
-                                                    .unwrap_or("unknown process"),
-                                            )
-                                            .color(TEXT)
-                                            .strong(),
-                                        );
-                                        ui.label(
-                                            RichText::new(connection.remote.to_string())
-                                                .monospace()
-                                                .color(MUTED),
-                                        );
-                                    });
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.label(
-                                            RichText::new(&connection.state)
-                                                .size(11.0)
-                                                .color(MUTED),
-                                        );
-                                    });
-                                });
-                                ui.separator();
-                            }
-                        });
-                }
-            }
-        });
-    }
-
-    fn reputation(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Hash reputation",
-            "Exact local IOC matches by default; VirusTotal is explicit, hash-only and opt-in.",
-        );
-        if self.reputation_status.is_none() {
-            self.refresh_reputation_status();
-        }
-        ui.columns(2, |columns| {
-            surface(&mut columns[0], |ui| {
-                section_title(ui, "Local SHA-256 index", "Files never leave this laptop.");
-                ui.add_space(12.0);
-                let status = self.reputation_status.unwrap_or_default();
-                ui.label(
-                    RichText::new(status.local_hashes.to_string())
-                        .size(28.0)
-                        .strong()
-                        .color(TEXT),
-                );
-                ui.label(
-                    RichText::new(format!("hashes from {} source(s)", status.local_sources))
-                        .color(MUTED),
-                );
-                ui.add_space(10.0);
-                if ui
-                    .add_enabled(
-                        !self.jobs.contains("reputation-sync"),
-                        egui::Button::new("Update hash feeds"),
-                    )
-                    .clicked()
-                {
-                    self.sync_reputation();
-                }
-            });
-            surface(&mut columns[1], |ui| {
-                section_title(
-                    ui,
-                    "VirusTotal",
-                    "Only the SHA-256 is sent; files are never uploaded.",
-                );
-                ui.add_space(12.0);
-                let enabled = self.deps.config.reputation.virustotal_enabled;
-                ui.label(
-                    RichText::new(if enabled { "ENABLED" } else { "DISABLED" })
-                        .color(if enabled { GREEN } else { MUTED })
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "Credential: {}",
-                        self.deps
-                            .config
-                            .reputation
-                            .virustotal_api_key_file
-                            .as_deref()
-                            .unwrap_or(&self.deps.config.reputation.virustotal_api_key_env)
-                    ))
-                    .monospace()
-                    .color(MUTED),
-                );
-                ui.add_enabled_ui(enabled, |ui| {
-                    ui.checkbox(
-                        &mut self.reputation_online,
-                        "Use online hash lookup for this check",
-                    );
-                });
-            });
-        });
-        ui.add_space(16.0);
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Check one file",
-                "Local lookup is always performed first.",
-            );
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [ui.available_width() - 125.0, 36.0],
-                    egui::TextEdit::singleline(&mut self.reputation_path)
-                        .hint_text("/path/to/file"),
-                );
-                if ui
-                    .add_enabled(
-                        !self.jobs.contains("reputation-check"),
-                        egui::Button::new("Check hash"),
-                    )
-                    .clicked()
-                {
-                    self.check_reputation();
-                }
-            });
-            if let Some(result) = &self.reputation_result {
-                ui.add_space(12.0);
-                ui.label(RichText::new(&result.sha256).monospace().color(BLUE));
-                ui.label(
-                    RichText::new(format!(
-                        "Local: {}",
-                        result.local_match.as_deref().unwrap_or("not listed")
-                    ))
-                    .color(TEXT),
-                );
-                if let Some(vt) = &result.virustotal {
-                    ui.label(
-                        RichText::new(format!(
-                            "VirusTotal: {} · malicious {} · suspicious {} · harmless {}",
-                            vt.verdict, vt.malicious, vt.suspicious, vt.harmless
-                        ))
-                        .color(if vt.malicious > 0 {
-                            AMBER
-                        } else {
-                            MUTED
-                        }),
-                    );
-                }
-            }
-        });
-    }
-
-    fn cleanup(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Cleanup & performance",
-            "Analyze first. Nothing is selected automatically and every deletion requires an exact phrase.",
-        );
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.jobs.contains("cleanup-scan") && !self.jobs.contains("cleanup-apply"),
-                    egui::Button::new("Analyze storage"),
-                )
-                .clicked()
-            {
-                self.run_cleanup_scan();
-            }
-            if self.jobs.contains("cleanup-scan") {
-                ui.spinner();
-                ui.label(RichText::new("Scanning bounded cleanup locations…").color(MUTED));
-            }
-            ui.label(
-                RichText::new("EFI, backups, snapshots and partial downloads are protected.")
-                    .color(MUTED),
-            );
-        });
-        ui.add_space(14.0);
-
-        if let Some(performance) = &self.cleanup_performance {
-            ui.columns(3, |columns| {
-                stat_card(
-                    &mut columns[0],
-                    "MEMORY AVAILABLE MiB",
-                    (performance.memory_available_bytes / (1024 * 1024)) as i64,
-                    GREEN,
-                );
-                stat_card(
-                    &mut columns[1],
-                    "MEMORY USED MiB",
-                    ((performance
-                        .memory_total_bytes
-                        .saturating_sub(performance.memory_available_bytes))
-                        / (1024 * 1024)) as i64,
-                    AMBER,
-                );
-                stat_card(
-                    &mut columns[2],
-                    "PROCESSES",
-                    performance.process_count as i64,
-                    BLUE,
-                );
-            });
-            ui.add_space(14.0);
-        }
-
-        let Some(report) = self.cleanup_report.clone() else {
-            surface(ui, |ui| {
-                empty_state(
-                    ui,
-                    "No cleanup analysis yet",
-                    "Select Analyze storage. The analysis itself is read-only.",
-                );
-            });
-            return;
-        };
-
-        ui.columns(3, |columns| {
-            cleanup_summary_card(
-                &mut columns[0],
-                "SAFE / REBUILDABLE",
-                report.safe_bytes,
-                GREEN,
-            );
-            cleanup_summary_card(
-                &mut columns[1],
-                "REVIEW REQUIRED",
-                report.review_bytes,
-                AMBER,
-            );
-            cleanup_summary_unknown_card(&mut columns[2], "PROTECTED / LIST ONLY", RED);
-        });
-        ui.add_space(14.0);
-
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Cleanup candidates",
-                "Select only what you reviewed. Protected and elevated items cannot be selected here.",
-            );
-            ui.add_space(8.0);
-            egui::ScrollArea::vertical()
-                .max_height(350.0)
-                .show(ui, |ui| {
-                    for candidate in &report.candidates {
-                        let selectable = candidate.supported
-                            && !candidate.requires_root
-                            && candidate.risk != blue_cleanup::CleanupRisk::Protected;
-                        let mut selected = self.cleanup_selected.contains(&candidate.id);
-                        ui.horizontal(|ui| {
-                            let response =
-                                ui.add_enabled(selectable, egui::Checkbox::new(&mut selected, ""));
-                            if response.changed() {
-                                if selected {
-                                    self.cleanup_selected.insert(candidate.id.clone());
-                                } else {
-                                    self.cleanup_selected.remove(&candidate.id);
-                                }
-                                self.cleanup_confirmation.clear();
-                            }
-                            cleanup_risk_badge(ui, candidate.risk);
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(&candidate.label).color(TEXT).strong());
-                                ui.label(RichText::new(&candidate.reason).size(11.0).color(MUTED));
-                                if let Some(path) = &candidate.path {
-                                    ui.label(
-                                        RichText::new(path.to_string_lossy())
-                                            .size(10.0)
-                                            .monospace()
-                                            .color(MUTED),
-                                    );
-                                }
-                                if let Some(warning) = &candidate.warning {
-                                    ui.label(RichText::new(warning).size(10.0).color(AMBER));
-                                }
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(
-                                        if candidate.risk == blue_cleanup::CleanupRisk::Protected
-                                            && candidate.bytes == 0
-                                        {
-                                            "not sized".to_owned()
-                                        } else {
-                                            format_bytes(candidate.bytes)
-                                        },
-                                    )
-                                    .monospace()
-                                    .color(if selectable {
-                                        TEXT
-                                    } else {
-                                        MUTED
-                                    }),
-                                );
-                                if !selectable {
-                                    ui.label(
-                                        RichText::new("LIST ONLY").size(9.0).strong().color(RED),
-                                    );
-                                }
-                            });
-                        });
-                        ui.separator();
-                    }
-                });
-        });
-
-        ui.add_space(14.0);
-        let selected = report
-            .candidates
-            .iter()
-            .filter(|candidate| self.cleanup_selected.contains(&candidate.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Explicit approval",
-                "The engine rescans and revalidates every selected path before deletion.",
-            );
-            if selected.is_empty() {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Nothing selected — this is the default.").color(GREEN));
-            } else {
-                let required = blue_cleanup::CleanupEngine::required_confirmation(&selected);
-                let selected_bytes = selected
-                    .iter()
-                    .fold(0u64, |total, item| total.saturating_add(item.bytes));
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!(
-                        "{} item(s), {} estimated. Type exactly:",
-                        selected.len(),
-                        format_bytes(selected_bytes)
-                    ))
-                    .color(TEXT),
-                );
-                ui.label(RichText::new(&required).monospace().strong().color(AMBER));
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [ui.available_width() - 145.0, 34.0],
-                        egui::TextEdit::singleline(&mut self.cleanup_confirmation)
-                            .hint_text("confirmation phrase"),
-                    );
-                    if ui
-                        .add_enabled(
-                            self.cleanup_confirmation == required
-                                && !self.jobs.contains("cleanup-apply"),
-                            egui::Button::new("Delete selected")
-                                .fill(Color32::from_rgb(64, 30, 36))
-                                .stroke(Stroke::new(1.0, RED)),
-                        )
-                        .clicked()
-                    {
-                        self.apply_cleanup();
-                    }
-                });
-            }
-            ui.add_space(8.0);
-            let setup_dir = extension_path()
-                .parent()
-                .map(|path| path.join("scripts"))
-                .unwrap_or_else(|| PathBuf::from("scripts"));
-            if ui.button("Copy system cleanup plan command").clicked() {
-                ui.ctx()
-                    .copy_text(script_plan_command(&setup_dir.join("cleanup-system.sh")));
-                self.message = Some(("Read-only system cleanup plan command copied".into(), true));
-            }
-        });
-
-        if let Some(performance) = &self.cleanup_performance {
-            ui.add_space(14.0);
-            surface(ui, |ui| {
-                section_title(
-                    ui,
-                    "Largest resident processes",
-                    "Observation only — Blue does not kill applications from Cleanup.",
-                );
-                for process in &performance.top_memory {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&process.name).color(TEXT));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format_bytes(process.rss_bytes))
-                                    .monospace()
-                                    .color(MUTED),
-                            );
-                            ui.label(
-                                RichText::new(format!("PID {}", process.pid))
-                                    .size(10.0)
-                                    .color(MUTED),
-                            );
-                        });
-                    });
-                    ui.separator();
-                }
-            });
-        }
-    }
-
-    fn quarantine(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Quarantine",
-            "Held files are inert and restorable. Blue never auto-deletes them.",
-        );
-        let items = self.snapshot.quarantine.clone();
-        surface(ui, |ui| {
-            if items.is_empty() {
-                empty_state(
-                    ui,
-                    "Quarantine is empty",
-                    "Corroborated files will appear here with their evidence.",
-                );
-                return;
-            }
-            egui::ScrollArea::vertical()
-                .max_height(520.0)
-                .show(ui, |ui| {
-                    for item in &items {
-                        ui.horizontal(|ui| {
-                            tier_badge(ui, item.tier);
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(&item.original_path).color(TEXT).strong());
-                                ui.label(RichText::new(&item.reason).size(12.0).color(MUTED));
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .add_enabled(
-                                        !self.jobs.contains("restore"),
-                                        egui::Button::new("Restore"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.restore(item.id);
-                                }
-                                ui.label(RichText::new(format!("#{}", item.id)).color(MUTED));
-                            });
-                        });
-                        ui.separator();
-                    }
-                });
-        });
-    }
-
-    fn filters(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Filter feeds",
-            "Versioned domain lists for ads, trackers and known malware infrastructure.",
-        );
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.jobs.contains("feeds"),
-                    egui::Button::new("Update filters"),
-                )
-                .clicked()
-            {
-                self.sync_feeds();
-            }
-            if self.jobs.contains("feeds") {
-                ui.spinner();
-                ui.label(RichText::new("Downloading and validating…").color(MUTED));
-            }
-        });
-        ui.add_space(16.0);
-        let datasets = self.snapshot.datasets.clone();
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Installed datasets",
-                "A failed or undersized download never replaces a working list.",
-            );
-            ui.add_space(8.0);
-            if datasets.is_empty() {
-                empty_state(
-                    ui,
-                    "No filter datasets installed",
-                    "Select Update filters to fetch the configured sources.",
-                );
-            } else {
-                for dataset in datasets.iter().filter(|d| d.active) {
-                    ui.horizontal(|ui| {
-                        shield(ui, 24.0, GREEN);
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&dataset.name).strong().color(TEXT));
-                            ui.label(
-                                RichText::new(format!(
-                                    "version {} · {} KiB",
-                                    dataset.version,
-                                    dataset.size.unwrap_or(0) / 1024
-                                ))
-                                .color(MUTED),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new("ACTIVE").size(11.0).color(GREEN).strong());
-                            if ui
-                                .add_enabled(
-                                    !self.jobs.contains("rollback"),
-                                    egui::Button::new("Rollback"),
-                                )
-                                .clicked()
-                            {
-                                self.rollback_feed(dataset.name.clone());
-                            }
-                        });
-                    });
-                    ui.separator();
-                }
-            }
-        });
-    }
-
-    fn browser(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Browser Shield",
-            "The native companion for Chromium and Brave search protection.",
-        );
-        ui.columns(2, |columns| {
-            surface(&mut columns[0], |ui| {
-                section_title(
-                    ui,
-                    "Blue Search Guard",
-                    "Ad cleanup and malicious-domain blocking inside search results.",
-                );
-                ui.add_space(14.0);
-                for text in [
-                    "Removes sponsored search-result cards",
-                    "Warns before opening suspicious links",
-                    "Blocks known ad and tracker requests",
-                    "Checks search links against the desktop domain feed",
-                    "Keeps settings in the browser profile",
-                ] {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("✓").color(GREEN).strong());
-                        ui.label(RichText::new(text).color(TEXT));
-                    });
-                    ui.add_space(6.0);
-                }
-            });
-            surface(&mut columns[1], |ui| {
-                section_title(
-                    ui,
-                    "Install unpacked",
-                    "No browser-store account or remote code.",
-                );
-                ui.add_space(12.0);
-                ui.label(
-                    RichText::new("1. Open chrome://extensions or brave://extensions").color(TEXT),
-                );
-                ui.label(RichText::new("2. Enable Developer mode").color(TEXT));
-                ui.label(RichText::new("3. Select Load unpacked").color(TEXT));
-                ui.add_space(8.0);
-                let path = extension_path();
-                ui.label(
-                    RichText::new(path.to_string_lossy())
-                        .monospace()
-                        .color(BLUE),
-                );
-                if ui.button("Copy extension path").clicked() {
-                    ui.ctx().copy_text(path.to_string_lossy().into_owned());
-                    self.message = Some(("Extension path copied".into(), true));
-                }
-            });
-        });
-    }
-
-    fn settings(&mut self, ui: &mut egui::Ui) {
-        self.header(
-            ui,
-            "Settings",
-            "Configuration remains plain TOML and local to this device.",
-        );
-        surface(ui, |ui| {
-            section_title(
-                ui,
-                "Background services",
-                "Optional user services continue after this window closes.",
-            );
-            ui.add_space(8.0);
-            if protection_row(
-                ui,
-                "Integrity checks every 15 minutes",
-                "Runs blue-guard.timer as your user",
-                &mut self.guard_timer,
-            ) {
-                match set_user_unit("blue-guard.timer", self.guard_timer) {
-                    Ok(()) => self.message = Some(("Integrity schedule updated".into(), true)),
-                    Err(error) => {
-                        self.guard_timer = !self.guard_timer;
-                        self.message = Some((format!("Timer control failed: {error:#}"), false));
-                    }
-                }
-            }
-            ui.separator();
-            if protection_row(
-                ui,
-                "Observe new egress every 5 minutes",
-                "Read-only connection inventory; no firewall enforcement",
-                &mut self.net_timer,
-            ) {
-                match set_user_unit("blue-net.timer", self.net_timer) {
-                    Ok(()) => {
-                        self.message = Some(("Network observation schedule updated".into(), true))
-                    }
-                    Err(error) => {
-                        self.net_timer = !self.net_timer;
-                        self.message = Some((format!("Timer control failed: {error:#}"), false));
-                    }
-                }
-            }
-            ui.separator();
-            if protection_row(
-                ui,
-                "Daily malicious-hash feed updates",
-                "Exact SHA-256 IOCs remain local",
-                &mut self.reputation_timer,
-            ) {
-                match set_user_unit("blue-reputation.timer", self.reputation_timer) {
-                    Ok(()) => self.message = Some(("Hash feed schedule updated".into(), true)),
-                    Err(error) => {
-                        self.reputation_timer = !self.reputation_timer;
-                        self.message = Some((format!("Timer control failed: {error:#}"), false));
-                    }
-                }
-            }
-            ui.separator();
-            if protection_row(
-                ui,
-                "Daily filter updates",
-                "Runs blue-feeds.timer as your user",
-                &mut self.feed_timer,
-            ) {
-                match set_user_unit("blue-feeds.timer", self.feed_timer) {
-                    Ok(()) => self.message = Some(("Filter update schedule updated".into(), true)),
-                    Err(error) => {
-                        self.feed_timer = !self.feed_timer;
-                        self.message = Some((format!("Timer control failed: {error:#}"), false));
-                    }
-                }
-            }
-            ui.add_space(16.0);
-            section_title(
-                ui,
-                "Paths and policy",
-                "Read from the layered TOML configuration.",
-            );
-            ui.add_space(8.0);
-            for (label, value) in [
-                (
-                    "State directory",
-                    self.deps.config.state_dir().display().to_string(),
-                ),
-                ("Database", self.deps.config.db_path().display().to_string()),
-                ("DNS bind", self.deps.config.dns.bind.clone()),
-                (
-                    "System DNS route",
-                    if self.dns_routed {
-                        "Loopback resolver active"
-                    } else {
-                        "Not configured (safe default)"
-                    }
-                    .into(),
-                ),
-                ("Guard interval", "15 minutes (systemd timer)".into()),
-                (
-                    "Full package drift audit",
-                    if self.deps.config.guard.watch_packages {
-                        "Enabled"
-                    } else {
-                        "Opt-in (disabled)"
-                    }
-                    .into(),
-                ),
-                (
-                    "Quarantine threshold",
-                    "T2 corroborated (fixed safety policy)".into(),
-                ),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(label).color(MUTED).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(value).monospace().color(TEXT));
-                    });
-                });
-                ui.separator();
-            }
-            ui.add_space(8.0);
-            section_title(
-                ui,
-                "Confirmed system setup",
-                "These plans are read-only until you run their explicit confirmation command.",
-            );
-            let setup_dir = extension_path()
-                .parent()
-                .map(|path| path.join("scripts"))
-                .unwrap_or_else(|| PathBuf::from("scripts"));
-            for (label, script) in [
-                ("ClamAV", setup_dir.join("setup-clamav.sh")),
-                ("System DNS", setup_dir.join("setup-system-dns.sh")),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(label).color(MUTED).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Copy plan command").clicked() {
-                            ui.ctx().copy_text(script_plan_command(&script));
-                            self.message = Some((format!("{label} plan command copied"), true));
-                        }
-                    });
-                });
-            }
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(
-                    "This app is a native executable. It opens no listening HTTP port and contains no web view.",
-                )
-                .color(GREEN),
-            );
-        });
-        if let Some(error) = &self.refresh_error {
-            ui.add_space(12.0);
-            ui.colored_label(RED, format!("State refresh failed: {error}"));
-        }
+        shell::header(self, ui, title, subtitle);
     }
 }
 
 impl eframe::App for BlueApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_jobs();
-        if self.last_refresh.elapsed() > Duration::from_secs(2) {
+        if self.last_refresh.elapsed() > Duration::from_secs(5) {
             self.refresh();
             self.refresh_firewall();
         }
         self.sidebar(ui);
-        egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG).inner_margin(egui::Margin::same(28)))
-            .show(ui, |ui| match self.page {
-                Page::Overview => self.overview(ui),
-                Page::Scanner => self.scanner(ui),
-                Page::Integrity => self.integrity(ui),
-                Page::Network => self.network(ui),
-                Page::Firewall => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("firewall-page")
-                        .show(ui, |ui| self.firewall(ui));
-                }
-                Page::Reputation => self.reputation(ui),
-                Page::Cleanup => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("cleanup-page")
-                        .show(ui, |ui| self.cleanup(ui));
-                }
-                Page::Quarantine => self.quarantine(ui),
-                Page::Filters => self.filters(ui),
-                Page::Browser => self.browser(ui),
-                Page::Settings => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("settings-page")
-                        .show(ui, |ui| self.settings(ui));
-                }
-            });
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        shell::workspace(self, ui);
+        let focused = ui.input(|input| input.focused);
+        let interval = if focused || !self.jobs.is_empty() {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(2)
+        };
+        ui.ctx().request_repaint_after(interval);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -2293,6 +1012,9 @@ fn scan_tree(deps: &AppDeps, path: &Path) -> Result<ScanSummary> {
                 if outcome.quarantined.is_some() {
                     summary.quarantined += 1;
                 }
+                if outcome.containment_error.is_some() {
+                    summary.containment_failures += 1;
+                }
             }
             Err(_) => summary.errors += 1,
         }
@@ -2306,23 +1028,6 @@ fn is_bulk_build_dir(path: &Path) -> bool {
         .is_some_and(|n| matches!(n, ".git" | "node_modules" | "target" | ".cache"))
 }
 
-fn configure_style(ctx: &egui::Context) {
-    let mut style = (*ctx.global_style()).clone();
-    style.visuals.dark_mode = true;
-    style.visuals.panel_fill = BG;
-    style.visuals.window_fill = PANEL;
-    style.visuals.extreme_bg_color = Color32::from_rgb(10, 17, 29);
-    style.visuals.widgets.inactive.bg_fill = PANEL_HOVER;
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(27, 41, 63);
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(32, 49, 74);
-    style.visuals.selection.bg_fill = Color32::from_rgb(34, 89, 75);
-    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-    style.spacing.button_padding = Vec2::new(14.0, 8.0);
-    ctx.set_global_style(style);
-}
-
 fn surface(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     Frame::new()
         .fill(PANEL)
@@ -2333,83 +1038,12 @@ fn surface(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(RichText::new(title).size(16.0).strong().color(TEXT));
-    ui.label(RichText::new(subtitle).size(12.0).color(MUTED));
-}
-
-fn stat_card(ui: &mut egui::Ui, label: &str, value: i64, color: Color32) {
-    surface(ui, |ui| {
-        ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(value.to_string())
-                    .size(27.0)
-                    .strong()
-                    .color(TEXT),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("●").color(color));
-            });
-        });
-    });
-}
-
-fn cleanup_summary_card(ui: &mut egui::Ui, label: &str, bytes: u64, color: Color32) {
-    surface(ui, |ui| {
-        ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format_bytes(bytes))
-                    .size(24.0)
-                    .strong()
-                    .color(TEXT),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("●").color(color));
-            });
-        });
-    });
-}
-
-fn cleanup_summary_unknown_card(ui: &mut egui::Ui, label: &str, color: Color32) {
-    surface(ui, |ui| {
-        ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("not enumerated")
-                    .size(18.0)
-                    .strong()
-                    .color(TEXT),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("●").color(color));
-            });
-        });
-    });
-}
-
-fn cleanup_risk_badge(ui: &mut egui::Ui, risk: blue_cleanup::CleanupRisk) {
-    let (label, color) = match risk {
-        blue_cleanup::CleanupRisk::Safe => ("SAFE", GREEN),
-        blue_cleanup::CleanupRisk::Review => ("REVIEW", AMBER),
-        blue_cleanup::CleanupRisk::Protected => ("PROTECTED", RED),
-    };
-    Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(
-            color.r(),
-            color.g(),
-            color.b(),
-            28,
-        ))
-        .stroke(Stroke::new(1.0, color))
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(7, 3))
-        .show(ui, |ui| {
-            ui.label(RichText::new(label).size(9.0).strong().color(color));
-        });
+    ui.label(
+        RichText::new(title)
+            .font(shell::display_font(22.0))
+            .color(TEXT),
+    );
+    ui.add(egui::Label::new(RichText::new(subtitle).size(14.0).color(MUTED)).wrap());
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -2425,74 +1059,6 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
-}
-
-fn mini_stat(ui: &mut egui::Ui, label: &str, value: usize) {
-    ui.vertical_centered(|ui| {
-        ui.label(
-            RichText::new(value.to_string())
-                .size(24.0)
-                .strong()
-                .color(TEXT),
-        );
-        ui.label(RichText::new(label).size(11.0).color(MUTED));
-    });
-}
-
-fn protection_row(ui: &mut egui::Ui, title: &str, subtitle: &str, value: &mut bool) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(title).strong().color(TEXT));
-            ui.label(RichText::new(subtitle).color(MUTED));
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let label = if *value { "ON" } else { "OFF" };
-            changed = ui.toggle_value(value, label).changed();
-        });
-    });
-    changed
-}
-
-fn event_row(ui: &mut egui::Ui, event: &Event) {
-    let color = match event.level.as_str() {
-        "error" => RED,
-        "warn" => AMBER,
-        "notice" => BLUE,
-        _ => GREEN,
-    };
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("●").size(9.0).color(color));
-        ui.vertical(|ui| {
-            ui.label(
-                RichText::new(event.subject.as_deref().unwrap_or(&event.kind))
-                    .size(12.0)
-                    .color(TEXT),
-            );
-            ui.label(RichText::new(&event.kind).size(10.0).color(MUTED));
-        });
-    });
-    ui.add_space(4.0);
-}
-
-fn finding_row(ui: &mut egui::Ui, finding: &Finding, mut acknowledge: impl FnMut(i64)) {
-    ui.horizontal(|ui| {
-        tier_badge(ui, finding.tier);
-        ui.vertical(|ui| {
-            ui.label(RichText::new(&finding.subject).color(TEXT).strong());
-            ui.label(
-                RichText::new(format!("{} · {}", finding.kind, finding.detail))
-                    .size(11.0)
-                    .color(MUTED),
-            );
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.small_button("Acknowledge").clicked() {
-                acknowledge(finding.id);
-            }
-        });
-    });
-    ui.separator();
 }
 
 fn tier_badge(ui: &mut egui::Ui, tier: Tier) {
@@ -2526,35 +1092,18 @@ fn empty_state(ui: &mut egui::Ui, title: &str, subtitle: &str) {
         ui.add_space(28.0);
         shield(ui, 38.0, MUTED);
         ui.add_space(8.0);
-        ui.label(RichText::new(title).strong().color(TEXT));
-        ui.label(RichText::new(subtitle).size(12.0).color(MUTED));
+        ui.label(
+            RichText::new(title)
+                .font(shell::display_font(22.0))
+                .color(TEXT),
+        );
+        ui.add(egui::Label::new(RichText::new(subtitle).size(14.0).color(MUTED)).wrap());
         ui.add_space(28.0);
     });
 }
 
 fn shield(ui: &mut egui::Ui, size: f32, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-    let c = rect.center();
-    let points = vec![
-        egui::pos2(c.x, rect.top() + 3.0),
-        egui::pos2(rect.right() - 4.0, rect.top() + size * 0.28),
-        egui::pos2(rect.right() - 7.0, rect.bottom() - size * 0.25),
-        egui::pos2(c.x, rect.bottom() - 2.0),
-        egui::pos2(rect.left() + 7.0, rect.bottom() - size * 0.25),
-        egui::pos2(rect.left() + 4.0, rect.top() + size * 0.28),
-    ];
-    ui.painter().add(egui::Shape::convex_polygon(
-        points,
-        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 28),
-        Stroke::new(1.5, color),
-    ));
-    ui.painter().text(
-        c,
-        egui::Align2::CENTER_CENTER,
-        "✓",
-        FontId::proportional(size * 0.38),
-        color,
-    );
+    theme::icon(ui, theme::Icon::Overview, size, color);
 }
 
 fn extension_path() -> PathBuf {
@@ -2654,8 +1203,48 @@ fn system_dns_uses_loopback() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{script_plan_command, user_extension_path};
+    use super::{
+        glow_compatibility_command, preferred_renderer, script_plan_command, user_extension_path,
+    };
+    use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn wgpu_is_preferred_unless_glow_is_requested() {
+        for preference in [None, Some("wgpu"), Some("unknown")] {
+            assert!(matches!(
+                preferred_renderer(preference),
+                eframe::Renderer::Wgpu
+            ));
+        }
+        for preference in [Some("glow"), Some("GLOW")] {
+            assert!(matches!(
+                preferred_renderer(preference),
+                eframe::Renderer::Glow
+            ));
+        }
+    }
+
+    #[test]
+    fn compatibility_restart_preserves_program_and_arguments() {
+        let arguments = vec![
+            OsString::from("gui"),
+            OsString::from("--config=Blue Data.toml"),
+        ];
+        let command =
+            glow_compatibility_command(Path::new("/opt/Blue App/blue"), arguments.clone());
+        assert_eq!(command.get_program(), OsStr::new("/opt/Blue App/blue"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            arguments
+                .iter()
+                .map(OsString::as_os_str)
+                .collect::<Vec<_>>()
+        );
+        assert!(command.get_envs().any(|(name, value)| {
+            name == OsStr::new("BLUE_RENDERER") && value == Some(OsStr::new("glow"))
+        }));
+    }
 
     #[test]
     fn extension_assets_honor_absolute_xdg_data_home() {
