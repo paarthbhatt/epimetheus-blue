@@ -1,5 +1,8 @@
 /target
 **/*.rs.bk
+# Local agent tooling (not part of the app)
+/.opencode/
+/opencode.json
 *.db
 *.db-wal
 *.db-shm

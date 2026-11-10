@@ -82,7 +82,11 @@ install -d \
   "$HOME/.local/share/blue" \
   "$chromium_host_dir" \
   "$brave_host_dir"
-install -m 0755 target/release/blue "$bindir/blue"
+# Replace the executable atomically while the old watcher keeps running.
+# Truncating a live executable can fail with ETXTBSY and interrupt installation.
+binary_stage="$(mktemp "$bindir/.blue-install.XXXXXX")"
+install -m 0755 target/release/blue "$binary_stage"
+mv -f -- "$binary_stage" "$bindir/blue"
 if [[ -L "$native_host_path" ]]; then
   [[ "$(readlink "$native_host_path")" == 'blue' ]] \
     || die "refusing to replace unrelated native host symlink: $native_host_path"
