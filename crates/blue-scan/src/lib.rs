@@ -98,6 +98,9 @@ pub struct ScanOutcome {
     pub results: Vec<DetectorResult>,
     /// Quarantine record id, when the file actually moved.
     pub quarantined: Option<i64>,
+    /// A failed quarantine attempt; the detected tier and evidence are retained.
+    /// `None` also covers emergency-paused containment (T2+, no quarantine id).
+    pub containment_error: Option<String>,
 }
 
 pub struct ScanEngine {
@@ -200,6 +203,7 @@ impl ScanEngine {
                 tier: Tier::Observed,
                 results: Vec::new(),
                 quarantined: None,
+                containment_error: None,
             });
         }
 
@@ -266,8 +270,27 @@ impl ScanEngine {
                         error = %e,
                         "quarantine failed"
                     );
-                    quarantine_error = Some(e.to_string());
+                    quarantine_error = Some(format!("{e:#}"));
                 }
+            }
+        }
+
+        if let Some(error) = &quarantine_error {
+            let payload = serde_json::json!({
+                "artifact_id": artifact_id,
+                "sha256": sha256,
+                "tier": tier.label(),
+                "status": "failed",
+                "error": error,
+            });
+            if let Err(error) = self.db.event(
+                "scan.containment",
+                "error",
+                Some(&path.to_string_lossy()),
+                &payload.to_string(),
+                now_ms(),
+            ) {
+                tracing::error!(%error, "could not record containment failure; threat outcome retained");
             }
         }
 
@@ -292,7 +315,8 @@ impl ScanEngine {
         } else {
             "debug"
         };
-        self.db
+        let event_result = self
+            .db
             .event(
                 "scan",
                 level,
@@ -300,16 +324,20 @@ impl ScanEngine {
                 &payload.to_string(),
                 now_ms(),
             )
-            .with_context(|| format!("recording scan event for {}", path.display()))?;
+            .with_context(|| format!("recording scan event for {}", path.display()));
 
-        Ok(ScanOutcome {
-            path: path.to_path_buf(),
-            sha256,
-            artifact_id,
-            tier,
-            results,
-            quarantined,
-        })
+        finish_scan(
+            ScanOutcome {
+                path: path.to_path_buf(),
+                sha256,
+                artifact_id,
+                tier,
+                results,
+                quarantined,
+                containment_error: quarantine_error,
+            },
+            event_result,
+        )
     }
 
     pub(crate) fn is_excluded(&self, path: &Path) -> bool {
@@ -343,6 +371,22 @@ impl ScanEngine {
 
         results
     }
+}
+
+/// Artifact evidence and tier are already stored before containment. A later
+/// event-write failure must not hide a detected threat from callers or alerts.
+fn finish_scan(outcome: ScanOutcome, event_result: Result<i64>) -> Result<ScanOutcome> {
+    if let Err(error) = event_result {
+        if !outcome.tier.may_quarantine() {
+            return Err(error);
+        }
+        tracing::error!(
+            path = %outcome.path.display(),
+            %error,
+            "could not record scan event; detected threat outcome retained"
+        );
+    }
+    Ok(outcome)
 }
 
 fn build_excludes(patterns: &[String]) -> Result<GlobSet> {
@@ -415,6 +459,7 @@ mod tests {
             outcome.tier.label()
         );
         assert!(outcome.quarantined.is_some());
+        assert!(outcome.containment_error.is_none());
         assert!(outcome
             .results
             .iter()
@@ -435,6 +480,7 @@ mod tests {
         let outcome = f.engine.scan_path(&path).unwrap();
         assert_eq!(outcome.tier, Tier::Observed);
         assert!(outcome.quarantined.is_none());
+        assert!(outcome.containment_error.is_none());
         assert!(outcome.artifact_id > 0);
         assert!(!outcome.sha256.is_empty());
         assert!(path.exists(), "a clean file must not move");
@@ -471,6 +517,7 @@ mod tests {
         assert_eq!(outcome.tier, Tier::Observed);
         assert!(outcome.quarantined.is_none());
         assert!(outcome.results.is_empty());
+        assert!(outcome.containment_error.is_none());
         assert!(outcome.sha256.is_empty());
         assert_eq!(outcome.artifact_id, 0);
         assert!(path.exists());
@@ -486,8 +533,98 @@ mod tests {
         let outcome = f.engine.scan_path(&path).unwrap();
         assert!(outcome.tier >= Tier::Corroborated);
         assert!(outcome.quarantined.is_none());
+        assert!(outcome.containment_error.is_none());
+        assert!(!outcome.results.is_empty());
         assert!(path.exists(), "kill switch must leave the file in place");
         assert!(f.db.list_quarantine(false).unwrap().is_empty());
+        let events = f.db.recent_events(10).unwrap();
+        let scan = events.iter().find(|event| event.kind == "scan").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&scan.payload).unwrap();
+        assert_eq!(payload["kill_switch"], true);
+        assert_eq!(payload["tier"], Tier::Corroborated.label());
+    }
+
+    #[test]
+    fn containment_failure_retains_threat_evidence_and_source_bytes() {
+        let f = fixture(|_| {});
+        // A file where a staging directory would need to be created fails before
+        // any source mutation, without root privileges or permission changes.
+        let root = f.engine.quarantine.root();
+        std::fs::rename(root.join("items"), root.join("empty-items")).unwrap();
+        std::fs::write(root.join("items"), b"not a directory").unwrap();
+        let path = write(&f.dir, "eicar.com", EICAR.as_bytes());
+
+        let outcome = f.engine.scan_path(&path).unwrap();
+
+        assert_eq!(outcome.tier, Tier::Corroborated);
+        assert!(outcome.quarantined.is_none());
+        assert!(outcome.containment_error.is_some());
+        assert!(!outcome.results.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), EICAR.as_bytes());
+        assert!(f.db.list_quarantine(false).unwrap().is_empty());
+        assert_eq!(f.db.recent_artifacts(10).unwrap()[0].tier, outcome.tier);
+        let events = f.db.recent_events(10).unwrap();
+        let failure = events
+            .iter()
+            .find(|event| event.kind == "scan.containment")
+            .unwrap();
+        assert_eq!(failure.level, "error");
+        let detail: serde_json::Value = serde_json::from_str(&failure.payload).unwrap();
+        assert_eq!(detail["status"], "failed");
+        assert_eq!(detail["artifact_id"], outcome.artifact_id);
+        assert_eq!(
+            detail["error"],
+            outcome.containment_error.as_deref().unwrap()
+        );
+        let scan = events.iter().find(|event| event.kind == "scan").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&scan.payload).unwrap();
+        assert_eq!(payload["quarantine_error"], detail["error"]);
+        assert_eq!(payload["tier"], Tier::Corroborated.label());
+    }
+
+    #[test]
+    fn event_failure_does_not_discard_an_already_detected_threat() {
+        let outcome = ScanOutcome {
+            path: PathBuf::from("threat-fixture"),
+            sha256: "a".repeat(64),
+            artifact_id: 7,
+            tier: Tier::Corroborated,
+            results: vec![DetectorResult::new(
+                blue_core::Detector::Yara,
+                "test-signature",
+                Confidence::High,
+            )],
+            quarantined: None,
+            containment_error: Some("containment fixture failure".into()),
+        };
+        let retained = finish_scan(
+            outcome.clone(),
+            Err(anyhow::anyhow!("event fixture failure")),
+        )
+        .unwrap();
+        assert_eq!(retained.tier, outcome.tier);
+        assert_eq!(retained.artifact_id, outcome.artifact_id);
+        assert_eq!(retained.results.len(), 1);
+        assert_eq!(retained.sha256, outcome.sha256);
+        assert_eq!(retained.results[0].signature, outcome.results[0].signature);
+        assert_eq!(retained.containment_error, outcome.containment_error);
+
+        for quarantine_id in [None, Some(8)] {
+            let mut threat = outcome.clone();
+            threat.containment_error = None;
+            threat.quarantined = quarantine_id;
+            let retained =
+                finish_scan(threat, Err(anyhow::anyhow!("event fixture failure"))).unwrap();
+            assert_eq!(retained.tier, Tier::Corroborated);
+            assert_eq!(retained.quarantined, quarantine_id);
+            assert!(retained.containment_error.is_none());
+            assert_eq!(retained.results.len(), 1);
+        }
+
+        let mut candidate = outcome;
+        candidate.tier = Tier::Candidate;
+        candidate.containment_error = None;
+        assert!(finish_scan(candidate, Err(anyhow::anyhow!("event fixture failure"))).is_err());
     }
 
     #[test]

@@ -32,6 +32,9 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 UMask=0077
 ReadWritePaths=%h/.local/share/blue
+# Containment needs write access to the default watched folders, not all of HOME.
+# Custom roots require a reviewed service drop-in with matching writable paths.
+ReadWritePaths=-%h/Downloads -%h/tmp
 MemoryMax=512M
 TasksMax=64
 

@@ -53,6 +53,8 @@ enum Cmd {
     Guard,
     /// Observe current public egress destinations without changing the firewall.
     Network,
+    /// Automatically assess stored observations without trusting or erasing them.
+    Review,
     /// Filter feed maintenance.
     Feeds(FeedArgs),
     /// Local and optional hash-only reputation checks.
@@ -239,6 +241,11 @@ fn run() -> Result<()> {
         Some(Cmd::Quarantine(q)) => cmd_quarantine(&ctx, q),
         Some(Cmd::Guard) => cmd_guard(&ctx),
         Some(Cmd::Network) => cmd_network(&ctx),
+        Some(Cmd::Review) => {
+            let report = ctx.db.assess_findings(blue_core::now_ms())?;
+            println!("Assessed {} observations: {} informational, {} needing investigation, {} actionable; {} pending groups. Evidence and acknowledgements are unchanged.", report.assessed, report.informational, report.needs_investigation, report.actionable, report.pending_groups);
+            Ok(())
+        }
         Some(Cmd::Feeds(args)) => cmd_feeds(&ctx, args),
         Some(Cmd::Reputation(args)) => cmd_reputation(&ctx, args),
         Some(Cmd::Cleanup(args)) => cmd_cleanup(&ctx, args),
@@ -305,6 +312,12 @@ fn cmd_scan(ctx: &Ctx, args: ScanArgs) -> Result<()> {
         match engine.scan_path(path) {
             Ok(out) => {
                 counts[out.tier.as_i64() as usize] += 1;
+                if let Some(error) = &out.containment_error {
+                    eprintln!(
+                        "T2+ detection was not contained: {}: {error}",
+                        path.display()
+                    );
+                }
                 if out.quarantined.is_some() {
                     quarantined += 1;
                 }
