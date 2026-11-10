@@ -1119,6 +1119,7 @@ impl CleanupEngine {
                     "id": receipt.id,
                     "bytes_before": receipt.bytes_before,
                     "success": receipt.success,
+                    "error": receipt.error.as_deref().map(cleanup_failure_summary),
                 })
             })
             .collect();
@@ -1140,6 +1141,21 @@ impl CleanupEngine {
     }
 }
 
+fn cleanup_failure_summary(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("permission denied") {
+        "Cleanup access was denied; no additional privilege was granted."
+    } else if error.contains("read-only") {
+        "The selected location is read-only."
+    } else if error.contains("ownership") || error.contains("root-owned") {
+        "The selected tree crosses an ownership boundary."
+    } else if error.contains("changed") || error.contains("replaced") || error.contains("stale") {
+        "The selection changed after inventory; analyze it again."
+    } else {
+        "The action was refused or failed; detailed results remain in the cleanup view."
+    }
+}
+
 /// Refuse mixed-ownership trees before the first deletion. Without this pass,
 /// Recursive deletion can reclaim user-owned children and then fail on a
 /// root-owned package-build directory, producing a misleading partial result.
@@ -1156,7 +1172,13 @@ fn validate_user_owned_tree(path: &Path) -> Result<()> {
         let metadata = std::fs::symlink_metadata(&current)
             .with_context(|| format!("reading ownership for {}", current.display()))?;
         if metadata.file_type().is_symlink() {
-            bail!("ownership preflight encountered a symbolic link");
+            // Node package trees commonly contain relative links such as
+            // .bin/vite -> ../vite/bin/vite.js. The approved directory
+            // remover unlinks the link itself and never traverses its target,
+            // so an interior link is safe as long as its parent directory is
+            // user-owned. Candidate roots and path components remain rejected
+            // separately by path_has_symlink_component().
+            continue;
         }
         if metadata.uid() != own_uid {
             bail!(
@@ -1208,6 +1230,7 @@ struct Inventory {
     truncated: bool,
     max_candidates: usize,
     seen_ids: HashSet<String>,
+    estimate_diagnostics: HashSet<String>,
     discovery_entries: usize,
     candidate_limit_reached: bool,
     discovery_limit_reached: bool,
@@ -1221,6 +1244,7 @@ impl Inventory {
             truncated: false,
             max_candidates,
             seen_ids: HashSet::new(),
+            estimate_diagnostics: HashSet::new(),
             discovery_entries: 0,
             candidate_limit_reached: false,
             discovery_limit_reached: false,
@@ -1271,8 +1295,11 @@ impl Inventory {
     }
 
     fn absorb_estimate(&mut self, estimate: &SizeEstimate) {
-        self.diagnostics
-            .extend(estimate.diagnostics.iter().cloned());
+        for diagnostic in &estimate.diagnostics {
+            if self.estimate_diagnostics.insert(diagnostic.clone()) {
+                self.diagnostics.push(diagnostic.clone());
+            }
+        }
         self.truncated |= estimate.truncated;
     }
 
@@ -1613,6 +1640,23 @@ struct SizeEstimate {
     bytes: u64,
     diagnostics: Vec<String>,
     truncated: bool,
+    restricted: bool,
+}
+
+impl SizeEstimate {
+    fn record_failure(&mut self, path: &Path, error: std::io::Error) {
+        self.truncated = true;
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            let note = "Size totals are partial: restricted locations were skipped. Protected data is not read or deleted by unprivileged cleanup.";
+            if !self.restricted {
+                self.restricted = true;
+                self.diagnostics.push(note.to_owned());
+            }
+        } else {
+            self.diagnostics
+                .push(format!("Could not estimate {}: {error}", path.display()));
+        }
+    }
 }
 
 fn estimate_paths(roots: &[&Path]) -> SizeEstimate {
@@ -1624,10 +1668,7 @@ fn estimate_paths(roots: &[&Path]) -> SizeEstimate {
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) => {
-                estimate.diagnostics.push(format!(
-                    "Could not estimate {}: {error}",
-                    directory.display()
-                ));
+                estimate.record_failure(&directory, error);
                 continue;
             }
         };
@@ -1647,10 +1688,7 @@ fn estimate_paths(roots: &[&Path]) -> SizeEstimate {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    estimate.diagnostics.push(format!(
-                        "Could not read an entry under {}: {error}",
-                        directory.display()
-                    ));
+                    estimate.record_failure(&directory, error);
                     continue;
                 }
             };
@@ -1658,9 +1696,7 @@ fn estimate_paths(roots: &[&Path]) -> SizeEstimate {
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    estimate
-                        .diagnostics
-                        .push(format!("Could not size {}: {error}", path.display()));
+                    estimate.record_failure(&path, error);
                     continue;
                 }
             };
@@ -2151,6 +2187,47 @@ mod tests {
     use std::fs::{File, FileTimes};
     use tempfile::TempDir;
 
+    #[test]
+    fn restricted_estimates_are_partial_and_reported_once() {
+        let mut estimate = SizeEstimate::default();
+        for _ in 0..100 {
+            estimate.record_failure(
+                Path::new("/restricted"),
+                std::io::ErrorKind::PermissionDenied.into(),
+            );
+        }
+        assert!(estimate.truncated);
+        assert_eq!(estimate.diagnostics.len(), 1);
+        assert!(estimate.diagnostics[0].contains("restricted locations were skipped"));
+        let mut inventory = Inventory::new(10);
+        inventory.absorb_estimate(&estimate);
+        inventory.absorb_estimate(&estimate);
+        assert_eq!(inventory.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn user_owned_interior_symlinks_do_not_block_cleanup() {
+        let sandbox = TempDir::new().unwrap();
+        let root = sandbox.path().join("node_modules");
+        std::fs::create_dir_all(root.join(".bin")).unwrap();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/index.js"), b"module").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../pkg/index.js", root.join(".bin/tool")).unwrap();
+        validate_user_owned_tree(&root).expect("user-owned links are removable");
+    }
+
+    #[test]
+    fn unexpected_estimation_errors_are_not_hidden() {
+        let mut estimate = SizeEstimate::default();
+        estimate.record_failure(
+            Path::new("/test"),
+            std::io::Error::other("filesystem unavailable"),
+        );
+        assert!(estimate.truncated);
+        assert!(estimate.diagnostics[0].contains("filesystem unavailable"));
+    }
+
     fn write_file(path: &Path, contents: &[u8]) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
@@ -2192,6 +2269,31 @@ mod tests {
             .find(|candidate| candidate.path.as_deref() == Some(path))
             .unwrap()
             .clone()
+    }
+
+    #[test]
+    fn cleanup_receipts_retain_failure_reasons() {
+        let sandbox = TempDir::new().unwrap();
+        let (engine, db) = test_engine(&sandbox, sandbox.path(), vec![], 1);
+        let report = ApplyReport {
+            receipts: vec![ApplyReceipt {
+                id: "test".into(),
+                label: "Reviewed test candidate".into(),
+                bytes_before: 0,
+                success: false,
+                error: Some("Permission denied at /private/test/item".into()),
+            }],
+            reclaimed_estimate: 0,
+        };
+        engine.persist_receipts(&report).unwrap();
+        let events = db.recent_events(1).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+        assert!(payload["receipts"][0].get("label").is_none());
+        assert_eq!(
+            payload["receipts"][0]["error"],
+            "Cleanup access was denied; no additional privilege was granted."
+        );
+        assert!(!events[0].payload.contains("/private/test/item"));
     }
 
     fn set_modified(path: &Path, modified: SystemTime) {
