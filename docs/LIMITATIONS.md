@@ -1,4 +1,4 @@
-# Known limitations — experimental v0.5.0
+# Known limitations — experimental v0.6.0
 
 Epimetheus Blue is personal tooling for one Arch Linux workstation, not a
 Microsoft Defender replacement or an independently audited endpoint product.

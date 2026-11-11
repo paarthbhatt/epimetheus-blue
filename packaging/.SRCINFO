@@ -1,6 +1,6 @@
 pkgbase = epimetheus-blue
 	pkgdesc = Native personal security suite with malware, integrity, DNS and browser protection
-	pkgver = 0.5.0
+	pkgver = 0.6.0
 	pkgrel = 1
 	url = https://github.com/paarthbhatt/epimetheus-blue
 	arch = x86_64
@@ -34,7 +34,7 @@ pkgbase = epimetheus-blue
 	options = !lto
 	backup = etc/chromium/native-messaging-hosts/com.epimetheus.blue.json
 	backup = etc/brave/native-messaging-hosts/com.epimetheus.blue.json
-	source = https://github.com/paarthbhatt/epimetheus-blue/releases/download/v0.5.0/epimetheus-blue-0.5.0-source.tar.gz
-	sha256sums = 05129bdae41c8da320752adeac9584c39e30a66376bca87ef8cc9f525afb493b
+	source = https://github.com/paarthbhatt/epimetheus-blue/releases/download/v0.6.0/epimetheus-blue-0.6.0-source.tar.gz
+	sha256sums = ea5faa285cc6b97783658e8fcaf0dd7945749d0d92f4279a776e812ba315f101
 
 pkgname = epimetheus-blue

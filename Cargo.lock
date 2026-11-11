@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "blue-bin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-cleanup",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "blue-cleanup"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "blue-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "blue-dns"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "blue-feeds"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "blue-firewall"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "blue-firewall-helper"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-firewall",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "blue-guard"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "blue-native-host"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "blue-net"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "blue-reputation"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "blue-scan"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-core",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "blue-ui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blue-cleanup",

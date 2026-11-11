@@ -12,7 +12,7 @@ body:
     attributes:
       label: Blue version and source revision
       description: Release/version (blue --version), plus commit if built from source. Mark unknown if unavailable.
-      placeholder: "v0.5.0; commit ..."
+      placeholder: "v0.6.0; commit ..."
     validations:
       required: true
   - type: textarea

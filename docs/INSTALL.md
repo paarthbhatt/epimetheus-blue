@@ -1,4 +1,4 @@
-# Installing Epimetheus Blue 0.5.0
+# Installing Epimetheus Blue 0.6.0
 
 Choose **one** method: a prebuilt user-local archive, a source-built Arch package
 managed by pacman, or a user-local source build. None silently enables protection
@@ -12,13 +12,13 @@ Release builds pin the exact frozen source asset in `packaging/PKGBUILD` and
 release checksum. Do not use `--skipinteg`, replace it with `SKIP`, or disable
 tests to get past a release blocker.
 
-Use the finalized Arch source package, `epimetheus-blue-0.5.0-1.src.tar.gz`,
+Use the finalized Arch source package, `epimetheus-blue-0.6.0-1.src.tar.gz`,
 and the release's `SHA256SUMS`. The checksum manifest
-covers that source package and the exact `epimetheus-blue-0.5.0-source.tar.gz` asset
+covers that source package and the exact `epimetheus-blue-0.6.0-source.tar.gz` asset
 downloaded from:
 
 ```text
-https://github.com/paarthbhatt/epimetheus-blue/releases/download/v0.5.0/epimetheus-blue-0.5.0-source.tar.gz
+https://github.com/paarthbhatt/epimetheus-blue/releases/download/v0.6.0/epimetheus-blue-0.6.0-source.tar.gz
 ```
 
 With the release artifacts and checksum files in the same directory:
@@ -27,7 +27,7 @@ With the release artifacts and checksum files in the same directory:
 sha256sum --ignore-missing --check SHA256SUMS
 ```
 
-The v0.5.0 checksum manifest is **unsigned**. Checksums detect corruption and
+The v0.6.0 checksum manifest is **unsigned**. Checksums detect corruption and
 substitution against that manifest, not independent author authentication.
 Stop on a mismatch. Security-sensitive testers should review and build source;
 neither these checksums nor a GitHub download constitute an independent audit.
@@ -41,8 +41,8 @@ For current Arch Linux x86_64, download the Linux archive and `SHA256SUMS`, veri
 the checksum, then run:
 
 ```bash
-tar -xzf epimetheus-blue-0.5.0-linux-x86_64.tar.gz
-cd epimetheus-blue-0.5.0
+tar -xzf epimetheus-blue-0.6.0-linux-x86_64.tar.gz
+cd epimetheus-blue-0.6.0
 ./scripts/install-release.sh
 ~/.local/bin/blue
 ```
@@ -53,8 +53,11 @@ makes no firewall/DNS changes. See uninstall instructions below before starting.
 
 ### Maintainer: freeze source before publishing
 
+The full asset inventory, verification steps and publish procedure are in
+[RELEASES.md](RELEASES.md).
+
 The release source asset is a deterministic archive of the release tree, with an
-`epimetheus-blue-0.5.0/` prefix. It excludes `packaging/PKGBUILD` and
+`epimetheus-blue-0.6.0/` prefix. It excludes `packaging/PKGBUILD` and
 `packaging/.SRCINFO` so the source checksum cannot reference itself. Keep that
 asset immutable once published.
 
@@ -82,11 +85,11 @@ submit anything to the AUR.
 ## Option A: pacman-managed Arch package
 
 For installation without compiling, verify the release's
-`epimetheus-blue-0.5.0-1-x86_64.pkg.tar.zst` against `SHA256SUMS`, review the package
+`epimetheus-blue-0.6.0-1-x86_64.pkg.tar.zst` against `SHA256SUMS`, review the package
 contents with `pacman -Qip` and `pacman -Qlp`, then explicitly install it:
 
 ```bash
-sudo pacman -U ./epimetheus-blue-0.5.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./epimetheus-blue-0.6.0-1-x86_64.pkg.tar.zst
 ```
 
 The package is unsigned; this is a local package installation, not a signed
@@ -104,7 +107,7 @@ Extract the verified Arch source package into a fresh directory and review its
 recipe:
 
 ```bash
-tar -xf epimetheus-blue-0.5.0-1.src.tar.gz
+tar -xf epimetheus-blue-0.6.0-1.src.tar.gz
 cd epimetheus-blue
 less PKGBUILD
 makepkg --verifysource
@@ -159,7 +162,7 @@ desktop user. It creates its private state on first use, not during packaging.
 
 Extract the verified upstream source archive into a separate build directory.
 Use the same Rust/native-library requirements as the Arch build above. From
-its `epimetheus-blue-0.5.0/` root, as your desktop user:
+its `epimetheus-blue-0.6.0/` root, as your desktop user:
 
 ```bash
 cargo test --workspace --locked

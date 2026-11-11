@@ -1,7 +1,7 @@
 # Maintainer: Epimetheus Blue contributors
 
 pkgname=epimetheus-blue
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc='Native personal security suite with malware, integrity, DNS and browser protection'
 arch=('x86_64')
@@ -47,7 +47,7 @@ backup=(
 )
 source=("${url}/releases/download/v${pkgver}/${pkgname}-${pkgver}-source.tar.gz")
 # Frozen source asset; never replace it after publishing this checksum.
-sha256sums=('05129bdae41c8da320752adeac9584c39e30a66376bca87ef8cc9f525afb493b')
+sha256sums=('ea5faa285cc6b97783658e8fcaf0dd7945749d0d92f4279a776e812ba315f101')
 
 prepare() {
   cd "$srcdir/$pkgname-$pkgver"

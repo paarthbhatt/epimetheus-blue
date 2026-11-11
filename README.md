@@ -9,7 +9,7 @@ monitoring and approval-gated cleanup—without Electron or a local web dashboar
 > malware, and not Microsoft Defender detection parity. Test on a non-critical
 > machine first. Firewall, system DNS and cleanup are never activated by install.
 
-[Download v0.5.0](https://github.com/paarthbhatt/epimetheus-blue/releases/tag/v0.5.0)
+[Download v0.6.0](https://github.com/paarthbhatt/epimetheus-blue/releases/tag/v0.6.0)
 · [Install / uninstall](docs/INSTALL.md)
 · [Limitations](docs/LIMITATIONS.md)
 · [Report a vulnerability privately](SECURITY.md)
@@ -36,8 +36,8 @@ Download the x86_64 archive and `SHA256SUMS` from the prerelease, then verify:
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf epimetheus-blue-0.5.0-linux-x86_64.tar.gz
-cd epimetheus-blue-0.5.0
+tar -xzf epimetheus-blue-0.6.0-linux-x86_64.tar.gz
+cd epimetheus-blue-0.6.0
 ./scripts/install-release.sh
 ~/.local/bin/blue
 ```
@@ -88,4 +88,5 @@ Demo state only. Firewall is not activated; no real files are cleaned.
 - [Contributions and review](CONTRIBUTING.md) welcome—especially privileged-helper
   and cleanup security review. Public bug reports must omit credentials and private data.
 
-See [release notes](docs/RELEASE-v0.5.0.md) and [security policy](SECURITY.md).
+See [release notes](docs/RELEASE-v0.6.0.md), the
+[release and asset guide](docs/RELEASES.md) and [security policy](SECURITY.md).

@@ -3,6 +3,10 @@
 # Local agent tooling (not part of the app)
 /.opencode/
 /opencode.json
+# makepkg build artifacts
+packaging/src/
+packaging/pkg/
+*.pkg.tar.zst
 *.db
 *.db-wal
 *.db-shm

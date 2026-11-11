@@ -86,7 +86,7 @@ The same controls are available under **Settings** in the app after installation
 ## Browser/search extension
 
 The companion is in [`browser-extension/`](../browser-extension/) and the packaged
-archive is `dist/epimetheus-blue-search-guard-0.4.0.zip`.
+archive is `dist/epimetheus-blue-search-guard-0.5.0.zip`.
 
 For Chromium or Brave:
 
